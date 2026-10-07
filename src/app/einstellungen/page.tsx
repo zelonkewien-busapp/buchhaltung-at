@@ -1,6 +1,7 @@
 ﻿"use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import type { User } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/client";
 
@@ -34,6 +35,7 @@ const emptyProfile: BusinessProfile = {
 
 export default function Home() {
   const [supabase] = useState(() => createClient());
+  const router = useRouter();
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<BusinessProfile>(emptyProfile);
   const [isRegistering, setIsRegistering] = useState(true);
@@ -43,7 +45,10 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
 
-  async function loadProfile(userId: string) {
+  async function loadProfile(
+    userId: string,
+    accountEmail = user?.email ?? ""
+  ): Promise<boolean | null> {
     const { data, error } = await supabase
       .from("business_profiles")
       .select("*")
@@ -52,7 +57,7 @@ export default function Home() {
 
     if (error) {
       setMessage(`Betriebsdaten konnten nicht geladen werden: ${error.message}`);
-      return;
+      return null;
     }
 
     if (data) {
@@ -69,8 +74,10 @@ export default function Home() {
         tax_number: data.tax_number ?? "",
         is_small_business: data.is_small_business ?? true,
       });
+      return true;
     } else {
-      setProfile({ ...emptyProfile, email: user?.email ?? "" });
+      setProfile({ ...emptyProfile, email: accountEmail });
+      return false;
     }
   }
 
@@ -83,7 +90,7 @@ export default function Home() {
 
       if (data.user) {
         setUser(data.user);
-        await loadProfile(data.user.id);
+        await loadProfile(data.user.id, data.user.email ?? "");
       }
       setLoading(false);
     }
@@ -130,8 +137,17 @@ export default function Home() {
 
         if (data.user) {
           setUser(data.user);
-          await loadProfile(data.user.id);
-          setMessage("Du bist angemeldet.");
+          const profileExists = await loadProfile(
+            data.user.id,
+            data.user.email ?? email
+          );
+
+          if (profileExists) {
+            setMessage("Anmeldung erfolgreich. Übersicht wird geöffnet …");
+            router.replace("/");
+          } else if (profileExists === false) {
+            setMessage("Anmeldung erfolgreich. Bitte ergänze einmalig deine Betriebsdaten.");
+          }
         }
       }
     } catch (error) {
@@ -164,7 +180,8 @@ export default function Home() {
     if (error) {
       setMessage(`Speichern fehlgeschlagen: ${error.message}`);
     } else {
-      setMessage("Betriebsdaten wurden gespeichert.");
+      setMessage("Betriebsdaten gespeichert. Übersicht wird geöffnet …");
+      router.replace("/");
     }
   }
 

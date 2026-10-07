@@ -69,8 +69,9 @@ export default function VerkaufPage() {
 
       setUserId(auth.user.id);
       const [{ data: productData, error: productError }, { data: profileData }] = await Promise.all([
-        supabase.from("products").select("id, name, price")
-          .eq("user_id", auth.user.id).not("price", "is", null).order("name"),
+        supabase.from("products").select("id, name, price, barcode")
+          .eq("user_id", auth.user.id).eq("is_active", true)
+          .not("price", "is", null).order("name"),
         supabase.from("business_profiles").select("*")
           .eq("user_id", auth.user.id).maybeSingle(),
       ]);
@@ -326,7 +327,7 @@ export default function VerkaufPage() {
         <Link href="/" className="text-emerald-700 underline print:hidden">← Zur Übersicht</Link>
         <div className="mt-3 flex flex-wrap gap-4 print:hidden">
           <Link href="/auswertung" className="text-emerald-700 underline">Verkaufsauswertung</Link>
-          <Link href="/katalog" className="text-emerald-700 underline">Getränkekatalog</Link>
+          <Link href="/katalog" className="text-emerald-700 underline">Produktkatalog</Link>
         </div>
         <h1 className="mt-6 text-3xl font-bold print:hidden">Verkaufsbeleg erstellen</h1>
 

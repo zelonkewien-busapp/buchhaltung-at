@@ -8,8 +8,8 @@ const kacheln = [
     button: "Beleg erfassen",
   },
   {
-    titel: "Getränkekatalog und Bestand",
-    text: "Produkte, Preise und Warenzugänge verwalten.",
+    titel: "Produktkatalog und Bestand",
+    text: "Getränke, Snacks, Preise und Warenzugänge verwalten.",
     link: "/katalog",
     button: "Katalog öffnen",
   },

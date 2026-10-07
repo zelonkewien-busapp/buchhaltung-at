@@ -134,7 +134,7 @@ export default function Home() {
             Eingangsbeleg / Ausgabe erfassen →
           </Link>
           <Link href="/katalog" className="rounded-2xl bg-white p-6 font-semibold shadow-sm ring-1 ring-slate-200">
-            Getränkekatalog und Bestand →
+            Produktkatalog und Bestand →
           </Link>
         </section>
 

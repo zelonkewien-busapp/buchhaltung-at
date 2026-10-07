@@ -18,6 +18,18 @@ type ScannerTarget =
   | { kind: "new" }
   | { kind: "existing"; productId: string };
 
+const productCategories = [
+  "Softdrink",
+  "Bier",
+  "Wein und Spritzer",
+  "Heißgetränk",
+  "Saft",
+  "Snack",
+  "Sonstiges",
+];
+
+const productUnits = ["Flasche", "Glas", "Dose", "Tasse", "Stück"];
+
 export default function KatalogPage() {
   const [supabase] = useState(() => createClient());
   const [userId, setUserId] = useState("");
@@ -223,26 +235,83 @@ export default function KatalogPage() {
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
   }
 
+  async function findProductWithBarcode(
+    barcode: string,
+    excludedProductId?: string
+  ): Promise<Pick<Product, "id" | "name"> | null> {
+    const normalizedBarcode = barcode.trim();
+    if (!normalizedBarcode || !userId) return null;
+
+    let query = supabase
+      .from("products")
+      .select("id,name")
+      .eq("user_id", userId)
+      .eq("barcode", normalizedBarcode)
+      .limit(1);
+
+    if (excludedProductId) {
+      query = query.neq("id", excludedProductId);
+    }
+
+    const { data } = await query.maybeSingle();
+    return data;
+  }
+
+  function duplicateBarcodeMessage(barcode: string, productName?: string) {
+    return productName
+      ? `Der Barcode ${barcode} ist bereits bei „${productName}“ gespeichert.`
+      : `Der Barcode ${barcode} ist bereits bei einem anderen Produkt gespeichert.`;
+  }
+
+  function updateProductField(
+    productId: string,
+    field: "name" | "category" | "unit",
+    value: string
+  ) {
+    setProducts((current) =>
+      current.map((product) =>
+        product.id === productId ? { ...product, [field]: value } : product
+      )
+    );
+  }
+
   async function saveProduct(product: Product) {
     const priceText = prices[product.id] ?? "";
     const stockText = stocks[product.id] ?? "0";
     const price = parseAmount(priceText);
     const stock = parseAmount(stockText);
 
+    if (!product.name.trim()) {
+      setMessage("Bitte gib einen Produktnamen ein.");
+      return;
+    }
+
     if ((priceText.trim() !== "" && price === null) || stock === null) {
       setMessage("Bitte gib gültige, nicht negative Zahlen für Preis und Bestand ein.");
       return;
     }
 
+    const barcode = (barcodes[product.id] ?? "").trim();
+
     setBusy(true);
     setMessage("");
+
+    const duplicate = await findProductWithBarcode(barcode, product.id);
+    if (duplicate) {
+      setBusy(false);
+      setMessage(duplicateBarcodeMessage(barcode, duplicate.name));
+      return;
+    }
 
     const { error } = await supabase
       .from("products")
       .update({
+        name: product.name.trim(),
+        category: product.category,
+        unit: product.unit,
         price,
         stock,
-        barcode: (barcodes[product.id] ?? "").trim() || null,
+        barcode: barcode || null,
       })
       .eq("id", product.id)
       .eq("user_id", userId);
@@ -250,9 +319,84 @@ export default function KatalogPage() {
     setBusy(false);
 
     if (error) {
-      setMessage(`Speichern fehlgeschlagen: ${error.message}`);
+      setMessage(
+        error.code === "23505"
+          ? duplicateBarcodeMessage(barcode)
+          : `Speichern fehlgeschlagen: ${error.message}`
+      );
     } else {
       setMessage(`„${product.name}“ wurde gespeichert.`);
+      await loadProducts(userId);
+    }
+  }
+
+  async function removeProduct(product: Product) {
+    if (!userId || busy) return;
+
+    setBusy(true);
+    setMessage("");
+
+    const [productResult, fridgeResult] = await Promise.all([
+      supabase
+        .from("products")
+        .select("stock")
+        .eq("id", product.id)
+        .eq("user_id", userId)
+        .maybeSingle(),
+      supabase
+        .from("fridge_stock")
+        .select("quantity")
+        .eq("product_id", product.id)
+        .eq("user_id", userId),
+    ]);
+
+    if (productResult.error || fridgeResult.error) {
+      setBusy(false);
+      setMessage(
+        `Produkt konnte nicht geprüft werden: ${
+          productResult.error?.message ?? fridgeResult.error?.message
+        }`
+      );
+      return;
+    }
+
+    const catalogStock = Number(productResult.data?.stock ?? 0);
+    const fridgeStock = (fridgeResult.data ?? []).reduce(
+      (sum, row) => sum + Number(row.quantity ?? 0),
+      0
+    );
+
+    if (catalogStock > 0 || fridgeStock > 0) {
+      setBusy(false);
+      setMessage(
+        `„${product.name}“ hat noch Bestand (Katalog: ${catalogStock}, Kühlschränke: ${fridgeStock}). ` +
+          "Setze den Bestand zuerst auf 0 und lösche den Artikel danach."
+      );
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `„${product.name}“ wirklich aus dem Produktkatalog löschen? ` +
+        "Alte Rechnungen und Verkaufsdaten bleiben erhalten."
+    );
+
+    if (!confirmed) {
+      setBusy(false);
+      return;
+    }
+
+    const { error } = await supabase
+      .from("products")
+      .update({ is_active: false, barcode: null })
+      .eq("id", product.id)
+      .eq("user_id", userId);
+
+    setBusy(false);
+
+    if (error) {
+      setMessage(`Produkt konnte nicht gelöscht werden: ${error.message}`);
+    } else {
+      setMessage(`„${product.name}“ wurde aus dem Produktkatalog entfernt.`);
       await loadProducts(userId);
     }
   }
@@ -267,8 +411,17 @@ export default function KatalogPage() {
       return;
     }
 
+    const barcode = newBarcode.trim();
+
     setBusy(true);
     setMessage("");
+
+    const duplicate = await findProductWithBarcode(barcode);
+    if (duplicate) {
+      setBusy(false);
+      setMessage(duplicateBarcodeMessage(barcode, duplicate.name));
+      return;
+    }
 
     const { error } = await supabase.from("products").insert({
       user_id: userId,
@@ -276,7 +429,7 @@ export default function KatalogPage() {
       category,
       unit,
       price,
-      barcode: newBarcode.trim() || null,
+      barcode: barcode || null,
       stock: 0,
       is_active: true,
     });
@@ -284,7 +437,11 @@ export default function KatalogPage() {
     setBusy(false);
 
     if (error) {
-      setMessage(`Produkt konnte nicht angelegt werden: ${error.message}`);
+      setMessage(
+        error.code === "23505"
+          ? duplicateBarcodeMessage(barcode)
+          : `Produkt konnte nicht angelegt werden: ${error.message}`
+      );
     } else {
       setName("");
       setNewPrice("");
@@ -297,7 +454,7 @@ export default function KatalogPage() {
   if (loading) {
     return (
       <main className="min-h-screen bg-slate-50 p-8 text-slate-700">
-        Getränkekatalog wird geladen …
+        Produktkatalog wird geladen …
       </main>
     );
   }
@@ -311,9 +468,9 @@ export default function KatalogPage() {
 
         <header className="mb-8 mt-5">
           <p className="font-bold tracking-wide text-emerald-700">BUCHHALTUNG.AT</p>
-          <h1 className="mt-2 text-3xl font-bold">Getränkekatalog</h1>
+          <h1 className="mt-2 text-3xl font-bold">Produktkatalog</h1>
           <p className="mt-2 text-slate-600">
-            Ergänze deine Verkaufspreise und pflege den aktuellen Bestand.
+            Bearbeite Getränke und Snacks, Verkaufspreise, Barcodes und Bestände.
           </p>
         </header>
 
@@ -335,16 +492,52 @@ export default function KatalogPage() {
             {products.map((product) => (
               <article
                 key={product.id}
-                className="grid gap-4 rounded-xl bg-white p-5 shadow-sm sm:grid-cols-[1fr_minmax(250px,1.5fr)_150px_130px_auto] sm:items-end"
+                className="rounded-xl bg-white p-5 shadow-sm"
               >
-                <div>
-                  <h2 className="font-semibold">{product.name}</h2>
-                  <p className="text-sm text-slate-500">
-                    {product.category} · {product.unit}
-                  </p>
-                </div>
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                  <label className="block sm:col-span-2 lg:col-span-1">
+                    <span className="mb-1 block text-sm">Produktname</span>
+                    <input
+                      required
+                      value={product.name}
+                      onChange={(event) =>
+                        updateProductField(product.id, "name", event.target.value)
+                      }
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
+                    />
+                  </label>
 
-                <label className="block">
+                  <label className="block">
+                    <span className="mb-1 block text-sm">Kategorie</span>
+                    <select
+                      value={product.category}
+                      onChange={(event) =>
+                        updateProductField(product.id, "category", event.target.value)
+                      }
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
+                    >
+                      {productCategories.map((option) => (
+                        <option key={option}>{option}</option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-1 block text-sm">Einheit</span>
+                    <select
+                      value={product.unit}
+                      onChange={(event) =>
+                        updateProductField(product.id, "unit", event.target.value)
+                      }
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
+                    >
+                      {productUnits.map((option) => (
+                        <option key={option}>{option}</option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="block sm:col-span-2 lg:col-span-3">
                   <span className="mb-1 block text-sm">Barcode / EAN</span>
                   <div className="flex gap-2">
                     <input
@@ -364,9 +557,9 @@ export default function KatalogPage() {
                       Kamera
                     </button>
                   </div>
-                </label>
+                  </label>
 
-                <label className="block">
+                  <label className="block">
                   <span className="mb-1 block text-sm">Preis (€)</span>
                   <input
                     inputMode="decimal"
@@ -380,9 +573,9 @@ export default function KatalogPage() {
                     }
                     className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
                   />
-                </label>
+                  </label>
 
-                <label className="block">
+                  <label className="block">
                   <span className="mb-1 block text-sm">Bestand</span>
                   <input
                     inputMode="decimal"
@@ -395,16 +588,27 @@ export default function KatalogPage() {
                     }
                     className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
                   />
-                </label>
+                  </label>
+                </div>
 
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void saveProduct(product)}
-                  className="rounded-lg bg-emerald-700 px-4 py-2.5 font-semibold text-white disabled:opacity-60"
-                >
-                  Speichern
-                </button>
+                <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void saveProduct(product)}
+                    className="rounded-lg bg-emerald-700 px-4 py-2.5 font-semibold text-white disabled:opacity-60"
+                  >
+                    Änderungen speichern
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void removeProduct(product)}
+                    className="rounded-lg border border-red-300 px-4 py-2.5 font-semibold text-red-700 disabled:opacity-60"
+                  >
+                    Produkt löschen
+                  </button>
+                </div>
               </article>
             ))}
           </section>
@@ -431,12 +635,9 @@ export default function KatalogPage() {
                 onChange={(event) => setCategory(event.target.value)}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
               >
-                <option>Softdrink</option>
-                <option>Bier</option>
-                <option>Wein und Spritzer</option>
-                <option>Heißgetränk</option>
-                <option>Saft</option>
-                <option>Sonstiges</option>
+                {productCategories.map((option) => (
+                  <option key={option}>{option}</option>
+                ))}
               </select>
             </label>
 
@@ -447,11 +648,9 @@ export default function KatalogPage() {
                 onChange={(event) => setUnit(event.target.value)}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
               >
-                <option>Flasche</option>
-                <option>Glas</option>
-                <option> Dose</option>
-                <option>Tasse</option>
-                <option>Stück</option>
+                {productUnits.map((option) => (
+                  <option key={option}>{option}</option>
+                ))}
               </select>
             </label>
 
