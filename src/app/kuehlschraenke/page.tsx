@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
@@ -148,35 +148,56 @@ export default function KuehlschraenkePage() {
     setMessage(`„${product.name}“ gezählt.`);
   }
 
-  async function startScanner() {
-    if (!videoRef.current) return;
+  const startScanner = useCallback(async () => {
+    const video = videoRef.current;
+    if (!video || controlsRef.current) return;
 
     const reader = new BrowserMultiFormatReader();
     setMessage("Kamera wird gestartet …");
 
     try {
-      const controls = await reader.decodeFromVideoDevice(undefined, videoRef.current, (result) => {
-        if (!result) return;
+      const controls = await reader.decodeFromConstraints(
+        { audio: false, video: { facingMode: { ideal: "environment" } } },
+        video,
+        (result) => {
+          if (!result) return;
 
-        const code = result.getText().trim();
-        const now = Date.now();
-        if (lastScanRef.current.code === code && now - lastScanRef.current.time < 1200) return;
-        lastScanRef.current = { code, time: now };
+          const code = result.getText().trim();
+          const now = Date.now();
+          if (lastScanRef.current.code === code && now - lastScanRef.current.time < 1200) return;
+          lastScanRef.current = { code, time: now };
 
-        const product = products.find((item) => item.barcode?.trim() === code);
-        if (product) {
-          addScannedProduct(product);
-        } else {
-          setMessage(`Barcode ${code} ist noch keinem Artikel zugeordnet. Bitte im Getränkekatalog anlernen.`);
+          const product = products.find((item) => item.barcode?.trim() === code);
+          if (product) {
+            addScannedProduct(product);
+          } else {
+            setMessage(`Barcode ${code} ist noch keinem Artikel zugeordnet. Bitte im Getränkekatalog anlernen.`);
+          }
         }
-      });
+      );
 
       controlsRef.current = controls;
       setMessage("Scanne die Artikel, die jetzt noch im Kühlschrank sind.");
     } catch (error) {
       setMessage(error instanceof Error ? `Kamera konnte nicht starten: ${error.message}` : "Kamera konnte nicht starten.");
     }
-  }
+  }, [products]);
+
+  useEffect(() => {
+    if (!scannerOpen) return;
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (!cancelled) void startScanner();
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      controlsRef.current?.stop();
+      controlsRef.current = null;
+    };
+  }, [scannerOpen, startScanner]);
 
   function stopScanner() {
     controlsRef.current?.stop();
@@ -420,9 +441,13 @@ export default function KuehlschraenkePage() {
             <div className="mt-4 space-y-3">
               <video ref={videoRef} autoPlay playsInline className="w-full max-w-md rounded-xl bg-black" />
               <div className="flex flex-wrap gap-3">
-                <button type="button" onClick={() => void startScanner()}
+                <button type="button" onClick={() => {
+                  controlsRef.current?.stop();
+                  controlsRef.current = null;
+                  void startScanner();
+                }}
                   className="rounded-lg border border-emerald-700 px-4 py-2 font-semibold text-emerald-800">
-                  Kamera starten
+                  Kamera neu starten
                 </button>
                 <button type="button" onClick={stopScanner}
                   className="rounded-lg border border-slate-400 px-4 py-2">
