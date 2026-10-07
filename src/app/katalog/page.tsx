@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
 import { createClient } from "@/lib/supabase/client";
 
@@ -13,6 +13,10 @@ type Product = {
   stock: number;
   barcode: string | null;
 };
+
+type ScannerTarget =
+  | { kind: "new" }
+  | { kind: "existing"; productId: string };
 
 export default function KatalogPage() {
   const [supabase] = useState(() => createClient());
@@ -27,6 +31,8 @@ export default function KatalogPage() {
   const [newPrice, setNewPrice] = useState("");
   const [newBarcode, setNewBarcode] = useState("");
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [scannerTarget, setScannerTarget] = useState<ScannerTarget | null>(null);
+  const [scannerStatus, setScannerStatus] = useState<"idle" | "starting" | "active">("idle");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -88,62 +94,126 @@ export default function KatalogPage() {
     };
   }, [supabase]);
 
-  useEffect(() => () => controlsRef.current?.stop(), []);
-
-  async function startBarcodeScanner(target: "new" | string) {
-    const video = videoRef.current;
-    if (!video) {
-      setMessage("Kamerafenster ist noch nicht bereit. Bitte erneut tippen.");
-      return;
-    }
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setMessage("Dieser Browser unterstützt keinen Kamerazugriff. Bitte die Seite über HTTPS in Safari oder Chrome öffnen.");
-      return;
-    }
-
+  const releaseCamera = useCallback(() => {
     controlsRef.current?.stop();
     controlsRef.current = null;
-    setScannerOpen(true);
-    setMessage("Kamera wird gestartet …");
 
-    const reader = new BrowserMultiFormatReader();
-    try {
-      const controls = await reader.decodeFromConstraints(
-        { audio: false, video: { facingMode: { ideal: "environment" } } },
-        video,
-        (result) => {
-          if (!result) return;
-
-          const code = result.getText().trim();
-          const now = Date.now();
-          if (lastScanRef.current.code === code && now - lastScanRef.current.time < 1500) return;
-          lastScanRef.current = { code, time: now };
-
-          if (target === "new") {
-            setNewBarcode(code);
-          } else {
-            setBarcodes((current) => ({ ...current, [target]: code }));
-          }
-
-          setMessage(`Barcode ${code} erkannt und ins Barcode-Feld übernommen.`);
-          controlsRef.current?.stop();
-          controlsRef.current = null;
-          setScannerOpen(false);
-        }
-      );
-      controlsRef.current = controls;
-    } catch (error) {
-      setScannerOpen(false);
-      setMessage(error instanceof Error
-        ? `Kamera konnte nicht starten: ${error.message}`
-        : "Kamera konnte nicht starten. Bitte Kamerazugriff erlauben.");
+    const video = videoRef.current;
+    const stream = video?.srcObject;
+    if (stream instanceof MediaStream) {
+      stream.getTracks().forEach((track) => track.stop());
     }
+    if (video) video.srcObject = null;
+  }, []);
+
+  useEffect(() => () => releaseCamera(), [releaseCamera]);
+
+  useEffect(() => {
+    if (!scannerOpen || !scannerTarget) return;
+    const target = scannerTarget;
+
+    let cancelled = false;
+    let localControls: { stop: () => void } | null = null;
+
+    async function runScanner() {
+      const video = videoRef.current;
+      if (!video) {
+        setMessage("Kamerafenster konnte nicht geöffnet werden. Bitte erneut versuchen.");
+        setScannerOpen(false);
+        setScannerTarget(null);
+        setScannerStatus("idle");
+        return;
+      }
+
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setMessage("Dieser Browser unterstützt keinen Kamerazugriff. Bitte die HTTPS-Adresse in Safari oder Chrome öffnen.");
+        setScannerOpen(false);
+        setScannerTarget(null);
+        setScannerStatus("idle");
+        return;
+      }
+
+      const reader = new BrowserMultiFormatReader();
+      setScannerStatus("starting");
+      setMessage("Kamera wird gestartet …");
+
+      try {
+        const controls = await reader.decodeFromConstraints(
+          { audio: false, video: { facingMode: { ideal: "environment" } } },
+          video,
+          (result) => {
+            if (!result || cancelled) return;
+
+            const code = result.getText().trim();
+            const now = Date.now();
+            if (lastScanRef.current.code === code && now - lastScanRef.current.time < 1500) return;
+            lastScanRef.current = { code, time: now };
+
+            if (target.kind === "new") {
+              setNewBarcode(code);
+              setMessage(`Barcode ${code} erkannt. Bitte jetzt das Produkt hinzufügen.`);
+            } else {
+              setBarcodes((current) => ({ ...current, [target.productId]: code }));
+              setMessage(`Barcode ${code} erkannt. Bitte beim Artikel noch auf „Speichern“ tippen.`);
+            }
+
+            setScannerStatus("idle");
+            setScannerOpen(false);
+            setScannerTarget(null);
+          }
+        );
+
+        localControls = controls;
+        if (cancelled) {
+          controls.stop();
+          return;
+        }
+
+        controlsRef.current = controls;
+        setScannerStatus("active");
+        setMessage("Kamera aktiv – halte den Barcode ruhig und vollständig ins Bild.");
+      } catch (error) {
+        if (cancelled) return;
+        setScannerStatus("idle");
+        setScannerOpen(false);
+        setScannerTarget(null);
+        setMessage(
+          error instanceof Error
+            ? `Kamera konnte nicht starten: ${error.message}`
+            : "Kamera konnte nicht starten. Bitte Kamerazugriff erlauben."
+        );
+      }
+    }
+
+    void runScanner();
+
+    return () => {
+      cancelled = true;
+      localControls?.stop();
+      if (controlsRef.current === localControls) controlsRef.current = null;
+
+      const video = videoRef.current;
+      const stream = video?.srcObject;
+      if (stream instanceof MediaStream) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
+      if (video) video.srcObject = null;
+    };
+  }, [scannerOpen, scannerTarget]);
+
+  function openBarcodeScanner(target: ScannerTarget) {
+    releaseCamera();
+    lastScanRef.current = { code: "", time: 0 };
+    setScannerTarget(target);
+    setScannerStatus("starting");
+    setScannerOpen(true);
   }
 
   function stopBarcodeScanner() {
-    controlsRef.current?.stop();
-    controlsRef.current = null;
+    releaseCamera();
+    setScannerStatus("idle");
     setScannerOpen(false);
+    setScannerTarget(null);
     setMessage("Kamera geschlossen.");
   }
 
@@ -289,7 +359,7 @@ export default function KatalogPage() {
                       }
                       className="min-w-0 w-full rounded-lg border border-slate-300 px-3 py-2.5"
                     />
-                    <button type="button" onClick={() => void startBarcodeScanner(product.id)}
+                    <button type="button" onClick={() => openBarcodeScanner({ kind: "existing", productId: product.id })}
                       className="shrink-0 rounded-lg border border-emerald-700 px-3 py-2.5 font-semibold text-emerald-800">
                       Kamera
                     </button>
@@ -406,20 +476,11 @@ export default function KatalogPage() {
                   placeholder="Barcode scannen oder eingeben"
                   className="min-w-0 w-full rounded-lg border border-slate-300 px-3 py-2.5"
                 />
-                <button type="button" onClick={() => void startBarcodeScanner("new")}
+                <button type="button" onClick={() => openBarcodeScanner({ kind: "new" })}
                   className="shrink-0 rounded-lg border border-emerald-700 px-3 py-2.5 font-semibold text-emerald-800">
                   Kamera
                 </button>
               </div>
-            </div>
-
-            <div className={scannerOpen ? "space-y-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 sm:col-span-2" : "hidden"}>
-              <p className="font-medium">Barcode mit der Rückkamera erfassen</p>
-              <video ref={videoRef} autoPlay playsInline className="w-full max-w-lg rounded-lg bg-black" />
-              <button type="button" onClick={stopBarcodeScanner}
-                className="rounded-lg border border-slate-400 px-4 py-2 font-medium">
-                Kamera schließen
-              </button>
             </div>
 
             <button
@@ -436,6 +497,41 @@ export default function KatalogPage() {
           Hinterlege bei jedem Produkt den Barcode. Beim Scannen im Verkauf wird
           der Artikel erkannt und zum Warenkorb hinzugefügt.
         </p>
+
+        {scannerOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4">
+            <section className="w-full max-w-lg rounded-2xl bg-white p-4 shadow-2xl sm:p-5">
+              <h2 className="text-xl font-bold">Barcode scannen</h2>
+              <p className="mt-1 text-sm text-slate-600">
+                Halte den Strichcode vollständig und möglichst gerade ins Bild.
+              </p>
+
+              <div className="relative mt-4 overflow-hidden rounded-xl bg-black">
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  muted
+                  playsInline
+                  className="h-[55vh] max-h-[560px] w-full object-cover"
+                />
+                {scannerStatus === "starting" && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/70 p-4 text-center font-semibold text-white">
+                    Kamera wird gestartet …
+                  </div>
+                )}
+                <div className="pointer-events-none absolute inset-x-[8%] top-1/2 h-28 -translate-y-1/2 rounded-lg border-2 border-emerald-400" />
+              </div>
+
+              <button
+                type="button"
+                onClick={stopBarcodeScanner}
+                className="mt-4 w-full rounded-lg border border-slate-400 px-4 py-3 font-semibold"
+              >
+                Kamera schließen
+              </button>
+            </section>
+          </div>
+        )}
       </div>
     </main>
   );
