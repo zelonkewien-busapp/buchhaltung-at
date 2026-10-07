@@ -1,6 +1,7 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
+import { BrowserMultiFormatReader } from "@zxing/browser";
 import { createClient } from "@/lib/supabase/client";
 
 type Product = {
@@ -25,9 +26,13 @@ export default function KatalogPage() {
   const [unit, setUnit] = useState("Flasche");
   const [newPrice, setNewPrice] = useState("");
   const [newBarcode, setNewBarcode] = useState("");
+  const [scannerOpen, setScannerOpen] = useState(false);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const controlsRef = useRef<{ stop: () => void } | null>(null);
+  const lastScanRef = useRef({ code: "", time: 0 });
 
   async function loadProducts(id: string) {
     const { data, error } = await supabase
@@ -82,6 +87,65 @@ export default function KatalogPage() {
       active = false;
     };
   }, [supabase]);
+
+  useEffect(() => () => controlsRef.current?.stop(), []);
+
+  async function startBarcodeScanner(target: "new" | string) {
+    const video = videoRef.current;
+    if (!video) {
+      setMessage("Kamerafenster ist noch nicht bereit. Bitte erneut tippen.");
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMessage("Dieser Browser unterstützt keinen Kamerazugriff. Bitte die Seite über HTTPS in Safari oder Chrome öffnen.");
+      return;
+    }
+
+    controlsRef.current?.stop();
+    controlsRef.current = null;
+    setScannerOpen(true);
+    setMessage("Kamera wird gestartet …");
+
+    const reader = new BrowserMultiFormatReader();
+    try {
+      const controls = await reader.decodeFromConstraints(
+        { audio: false, video: { facingMode: { ideal: "environment" } } },
+        video,
+        (result) => {
+          if (!result) return;
+
+          const code = result.getText().trim();
+          const now = Date.now();
+          if (lastScanRef.current.code === code && now - lastScanRef.current.time < 1500) return;
+          lastScanRef.current = { code, time: now };
+
+          if (target === "new") {
+            setNewBarcode(code);
+          } else {
+            setBarcodes((current) => ({ ...current, [target]: code }));
+          }
+
+          setMessage(`Barcode ${code} erkannt und ins Barcode-Feld übernommen.`);
+          controlsRef.current?.stop();
+          controlsRef.current = null;
+          setScannerOpen(false);
+        }
+      );
+      controlsRef.current = controls;
+    } catch (error) {
+      setScannerOpen(false);
+      setMessage(error instanceof Error
+        ? `Kamera konnte nicht starten: ${error.message}`
+        : "Kamera konnte nicht starten. Bitte Kamerazugriff erlauben.");
+    }
+  }
+
+  function stopBarcodeScanner() {
+    controlsRef.current?.stop();
+    controlsRef.current = null;
+    setScannerOpen(false);
+    setMessage("Kamera geschlossen.");
+  }
 
   function parseAmount(value: string): number | null {
     if (value.trim() === "") return null;
@@ -201,7 +265,7 @@ export default function KatalogPage() {
             {products.map((product) => (
               <article
                 key={product.id}
-                className="grid gap-4 rounded-xl bg-white p-5 shadow-sm sm:grid-cols-[1fr_180px_150px_150px_auto] sm:items-end"
+                className="grid gap-4 rounded-xl bg-white p-5 shadow-sm sm:grid-cols-[1fr_minmax(250px,1.5fr)_150px_130px_auto] sm:items-end"
               >
                 <div>
                   <h2 className="font-semibold">{product.name}</h2>
@@ -212,18 +276,24 @@ export default function KatalogPage() {
 
                 <label className="block">
                   <span className="mb-1 block text-sm">Barcode / EAN</span>
-                  <input
-                    inputMode="numeric"
-                    placeholder="Barcode scannen oder eingeben"
-                    value={barcodes[product.id] ?? ""}
-                    onChange={(event) =>
-                      setBarcodes((current) => ({
-                        ...current,
-                        [product.id]: event.target.value,
-                      }))
-                    }
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
-                  />
+                  <div className="flex gap-2">
+                    <input
+                      inputMode="numeric"
+                      placeholder="Barcode scannen oder eingeben"
+                      value={barcodes[product.id] ?? ""}
+                      onChange={(event) =>
+                        setBarcodes((current) => ({
+                          ...current,
+                          [product.id]: event.target.value,
+                        }))
+                      }
+                      className="min-w-0 w-full rounded-lg border border-slate-300 px-3 py-2.5"
+                    />
+                    <button type="button" onClick={() => void startBarcodeScanner(product.id)}
+                      className="shrink-0 rounded-lg border border-emerald-700 px-3 py-2.5 font-semibold text-emerald-800">
+                      Kamera
+                    </button>
+                  </div>
                 </label>
 
                 <label className="block">
@@ -326,16 +396,31 @@ export default function KatalogPage() {
               />
             </label>
 
-            <label className="block">
+            <div className="block">
               <span className="mb-1 block text-sm">Barcode / EAN (optional)</span>
-              <input
-                inputMode="numeric"
-                value={newBarcode}
-                onChange={(event) => setNewBarcode(event.target.value)}
-                placeholder="Barcode scannen oder eingeben"
-                className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
-              />
-            </label>
+              <div className="flex gap-2">
+                <input
+                  inputMode="numeric"
+                  value={newBarcode}
+                  onChange={(event) => setNewBarcode(event.target.value)}
+                  placeholder="Barcode scannen oder eingeben"
+                  className="min-w-0 w-full rounded-lg border border-slate-300 px-3 py-2.5"
+                />
+                <button type="button" onClick={() => void startBarcodeScanner("new")}
+                  className="shrink-0 rounded-lg border border-emerald-700 px-3 py-2.5 font-semibold text-emerald-800">
+                  Kamera
+                </button>
+              </div>
+            </div>
+
+            <div className={scannerOpen ? "space-y-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 sm:col-span-2" : "hidden"}>
+              <p className="font-medium">Barcode mit der Rückkamera erfassen</p>
+              <video ref={videoRef} autoPlay playsInline className="w-full max-w-lg rounded-lg bg-black" />
+              <button type="button" onClick={stopBarcodeScanner}
+                className="rounded-lg border border-slate-400 px-4 py-2 font-medium">
+                Kamera schließen
+              </button>
+            </div>
 
             <button
               type="submit"
