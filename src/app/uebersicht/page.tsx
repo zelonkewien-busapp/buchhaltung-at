@@ -19,6 +19,12 @@ const kacheln = [
     link: "/",
     button: "Betriebsdaten öffnen",
   },
+  {
+    titel: "Jahresabschluss",
+    text: "Jahreszahlen prüfen, Inventur speichern und Steuerberaterpaket laden.",
+    link: "/jahresabschluss",
+    button: "Jahresabschluss öffnen",
+  },
 ];
 
 export default function Uebersicht() {
@@ -33,7 +39,7 @@ export default function Uebersicht() {
           </p>
         </header>
 
-        <section className="grid gap-5 md:grid-cols-3">
+        <section className="grid gap-5 md:grid-cols-2 xl:grid-cols-4">
           {kacheln.map((kachel) => (
             <article
               key={kachel.titel}

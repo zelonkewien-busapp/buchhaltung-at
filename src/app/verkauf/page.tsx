@@ -251,13 +251,16 @@ export default function VerkaufPage() {
     });
 
     const description = invoiceLines.map((line) => `${line.product_name} × ${line.quantity}`).join(", ");
+    const bookingDate = new Date().toISOString().slice(0, 10);
     const { data: booking, error: bookingError } = await supabase
       .from("bookings")
       .insert({
         user_id: auth.user.id,
-        booking_date: new Date().toISOString().slice(0, 10),
+        booking_date: bookingDate,
         type: "income",
         payment_method: paymentMethod,
+        payment_status: paymentMethod === "cash" ? "paid" : "open",
+        paid_at: paymentMethod === "cash" ? bookingDate : null,
         description: `Verkauf: ${description}`,
         amount: total,
         customer_name: paymentMethod === "bank" ? customerName.trim() : null,
@@ -306,7 +309,9 @@ export default function VerkaufPage() {
         })),
         total,
       });
-      setMessage("Rechnung erstellt. Du kannst sie jetzt drucken oder als PDF speichern.");
+      setMessage(
+        "Rechnung erstellt und als offen gespeichert. Nach Zahlungseingang kannst du sie im Jahresabschluss als bezahlt markieren."
+      );
     } else {
       setMessage(`Kassenbeleg gespeichert. Belegnummer: ${booking.booking_number}`);
     }

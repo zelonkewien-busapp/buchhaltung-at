@@ -243,13 +243,16 @@ export default function KuehlschraenkePage() {
       const description = sold
         .map((item) => `${item.product.name} × ${item.difference}`)
         .join(", ");
+      const bookingDate = new Date().toISOString().slice(0, 10);
 
       const { data: booking, error } = await supabase.from("bookings")
         .insert({
           user_id: userId,
-          booking_date: new Date().toISOString().slice(0, 10),
+          booking_date: bookingDate,
           type: "income",
           payment_method: paymentMethod,
+          payment_status: paymentMethod === "cash" ? "paid" : "open",
+          paid_at: paymentMethod === "cash" ? bookingDate : null,
           description: `Kühlschrankverkauf: ${description}`,
           amount: total,
           customer_name: customerName.trim(),

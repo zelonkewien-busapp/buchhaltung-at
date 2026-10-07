@@ -10,8 +10,26 @@ type SavedExpense = {
   invoice_number: string | null;
   invoice_date: string | null;
   total_amount: number | null;
+  expense_category: string;
+  payment_method: "cash" | "bank";
+  payment_status: "paid" | "open";
+  paid_at: string | null;
   created_at: string;
 };
+
+const expenseCategories = [
+  "Wareneinkauf",
+  "Sozialversicherung",
+  "Fahrzeugkosten",
+  "Telefon und Internet",
+  "Büromaterial",
+  "Werbung",
+  "Reise- und Fahrtkosten",
+  "Versicherungen und Beiträge",
+  "Beratungskosten",
+  "Miete",
+  "Sonstiges",
+];
 
 function parseGermanAmount(value: string): number | null {
   const cleaned = value
@@ -50,6 +68,10 @@ export default function AusgabenPage() {
   const [invoiceNumber, setInvoiceNumber] = useState("");
   const [invoiceDate, setInvoiceDate] = useState("");
   const [amount, setAmount] = useState("");
+  const [expenseCategory, setExpenseCategory] = useState("Wareneinkauf");
+  const [paymentMethod, setPaymentMethod] = useState<"cash" | "bank">("bank");
+  const [paymentStatus, setPaymentStatus] = useState<"paid" | "open">("paid");
+  const [paidAt, setPaidAt] = useState(() => new Date().toISOString().slice(0, 10));
   const [ocrText, setOcrText] = useState("");
   const [expenses, setExpenses] = useState<SavedExpense[]>([]);
   const [message, setMessage] = useState("");
@@ -59,7 +81,9 @@ export default function AusgabenPage() {
   async function loadExpenses(id: string) {
     const { data, error } = await supabase
       .from("incoming_expenses")
-      .select("id,supplier,invoice_number,invoice_date,total_amount,created_at")
+      .select(
+        "id,supplier,invoice_number,invoice_date,total_amount,expense_category,payment_method,payment_status,paid_at,created_at"
+      )
       .eq("user_id", id)
       .order("created_at", { ascending: false })
       .limit(10);
@@ -216,6 +240,11 @@ export default function AusgabenPage() {
       return;
     }
 
+    if (paymentStatus === "paid" && !paidAt) {
+      setMessage("Bitte das tatsächliche Zahlungsdatum eingeben.");
+      return;
+    }
+
     setBusy(true);
     setMessage("Beleg wird gespeichert …");
 
@@ -246,6 +275,10 @@ export default function AusgabenPage() {
         invoice_number: invoiceNumber.trim() || null,
         invoice_date: invoiceDate || null,
         total_amount: parsedAmount,
+        expense_category: expenseCategory,
+        payment_method: paymentMethod,
+        payment_status: paymentStatus,
+        paid_at: paymentStatus === "paid" ? paidAt : null,
         storage_path: storagePath,
         ocr_text: ocrText || null,
         status: "saved",
@@ -264,6 +297,10 @@ export default function AusgabenPage() {
     setInvoiceNumber("");
     setInvoiceDate("");
     setAmount("");
+    setExpenseCategory("Wareneinkauf");
+    setPaymentMethod("bank");
+    setPaymentStatus("paid");
+    setPaidAt(new Date().toISOString().slice(0, 10));
     setOcrText("");
     await loadExpenses(userId);
     setBusy(false);
@@ -375,6 +412,61 @@ export default function AusgabenPage() {
                   className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
                 />
               </label>
+
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">Ausgabenkategorie</span>
+                <select
+                  value={expenseCategory}
+                  onChange={(event) => setExpenseCategory(event.target.value)}
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5"
+                >
+                  {expenseCategories.map((category) => (
+                    <option key={category}>{category}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">Bezahlt über</span>
+                <select
+                  value={paymentMethod}
+                  onChange={(event) =>
+                    setPaymentMethod(event.target.value as "cash" | "bank")
+                  }
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5"
+                >
+                  <option value="bank">Bankkonto</option>
+                  <option value="cash">Barkasse</option>
+                </select>
+              </label>
+
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">Zahlungsstatus</span>
+                <select
+                  value={paymentStatus}
+                  onChange={(event) =>
+                    setPaymentStatus(event.target.value as "paid" | "open")
+                  }
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5"
+                >
+                  <option value="paid">Bezahlt</option>
+                  <option value="open">Noch offen</option>
+                </select>
+              </label>
+
+              {paymentStatus === "paid" && (
+                <label className="block">
+                  <span className="mb-1 block text-sm font-medium">
+                    Tatsächliches Zahlungsdatum
+                  </span>
+                  <input
+                    type="date"
+                    value={paidAt}
+                    onChange={(event) => setPaidAt(event.target.value)}
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2.5"
+                  />
+                </label>
+              )}
             </div>
 
             {ocrText && (
@@ -412,6 +504,9 @@ export default function AusgabenPage() {
                     <span className="block text-sm text-slate-500">
                       {expense.invoice_date || "Kein Datum"}
                       {expense.invoice_number ? ` · Nr. ${expense.invoice_number}` : ""}
+                    </span>
+                    <span className="block text-sm text-slate-500">
+                      {expense.expense_category || "Sonstiges"} · {expense.payment_method === "cash" ? "Bar" : "Bank"} · {expense.payment_status === "paid" ? `bezahlt${expense.paid_at ? ` am ${new Date(`${expense.paid_at}T00:00:00`).toLocaleDateString("de-AT")}` : ""}` : "noch offen"}
                     </span>
                   </span>
                   <span className="font-semibold">
