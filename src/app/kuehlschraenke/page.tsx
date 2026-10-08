@@ -26,15 +26,42 @@ type StockRow = {
   quantity: number | string;
 };
 
-type Mode = "load" | "sale" | "private";
+type Mode = "load" | "sale" | "group_sale" | "private";
+
+type GroupTrip = {
+  id: string;
+  fridge_id: string;
+  customer_name: string;
+  payment_method: "cash" | "bank";
+  customer_street: string | null;
+  customer_postal_code: string | null;
+  customer_city: string | null;
+  opened_at: string;
+};
+
+type TripWithdrawal = {
+  id: string;
+  trip_id: string;
+  product_id: string | null;
+  product_name: string;
+  quantity: number | string;
+  unit_price: number | string;
+};
 
 export default function KuehlschraenkePage() {
   const [userId, setUserId] = useState("");
   const [products, setProducts] = useState<Product[]>([]);
   const [fridges, setFridges] = useState<Fridge[]>([]);
   const [stock, setStock] = useState<StockRow[]>([]);
+  const [groupTrips, setGroupTrips] = useState<GroupTrip[]>([]);
+  const [tripWithdrawals, setTripWithdrawals] = useState<TripWithdrawal[]>([]);
   const [fridgeId, setFridgeId] = useState("");
   const [mode, setMode] = useState<Mode>("load");
+  const [selectedTripId, setSelectedTripId] = useState("");
+  const [newTripName, setNewTripName] = useState("");
+  const [tripStreet, setTripStreet] = useState("");
+  const [tripPostalCode, setTripPostalCode] = useState("");
+  const [tripCity, setTripCity] = useState("");
   const [counted, setCounted] = useState<Record<string, string>>({});
   const [customerName, setCustomerName] = useState("");
   const [street, setStreet] = useState("");
@@ -47,6 +74,13 @@ export default function KuehlschraenkePage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const controlsRef = useRef<{ stop: () => void } | null>(null);
   const lastScanRef = useRef({ code: "", time: 0 });
+
+  const selectedTrip = groupTrips.find((trip) => trip.id === selectedTripId) ?? null;
+  const selectedTripItems = tripWithdrawals.filter((row) => row.trip_id === selectedTripId);
+  const selectedTripTotal = selectedTripItems.reduce(
+    (sum, row) => sum + Number(row.quantity) * Number(row.unit_price),
+    0
+  );
 
   async function loadData(id: string) {
     const [productResult, fridgeResult] = await Promise.all([
@@ -91,6 +125,38 @@ export default function KuehlschraenkePage() {
       if (error) throw error;
       setStock((data ?? []) as StockRow[]);
     }
+    return activeFridge;
+  }
+
+  async function loadGroupTrips(id: string, selectedFridge = fridgeId) {
+    let query = supabase.from("group_sales_trips")
+      .select("id,fridge_id,customer_name,payment_method,customer_street,customer_postal_code,customer_city,opened_at")
+      .eq("user_id", id)
+      .eq("status", "open")
+      .order("opened_at", { ascending: false });
+    if (selectedFridge) query = query.eq("fridge_id", selectedFridge);
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const trips = (data ?? []) as GroupTrip[];
+    setGroupTrips(trips);
+    setSelectedTripId((current) =>
+      trips.some((trip) => trip.id === current) ? current : trips[0]?.id ?? ""
+    );
+
+    const ids = trips.map((trip) => trip.id);
+    if (!ids.length) {
+      setTripWithdrawals([]);
+      return;
+    }
+    const { data: withdrawals, error: withdrawalError } = await supabase
+      .from("group_sales_withdrawals")
+      .select("id,trip_id,product_id,product_name,quantity,unit_price")
+      .eq("user_id", id)
+      .in("trip_id", ids)
+      .order("withdrawn_at", { ascending: true });
+    if (withdrawalError) throw withdrawalError;
+    setTripWithdrawals((withdrawals ?? []) as TripWithdrawal[]);
   }
 
   useEffect(() => {
@@ -103,7 +169,8 @@ export default function KuehlschraenkePage() {
 
       setUserId(data.user.id);
       try {
-        await loadData(data.user.id);
+        const initialFridge = await loadData(data.user.id);
+        await loadGroupTrips(data.user.id, initialFridge);
       } catch (loadError) {
         setMessage(loadError instanceof Error ? loadError.message : "Daten konnten nicht geladen werden.");
       }
@@ -124,7 +191,59 @@ export default function KuehlschraenkePage() {
       .eq("fridge_id", id);
 
     if (error) setMessage(error.message);
-    else setStock((data ?? []) as StockRow[]);
+    else {
+      setStock((data ?? []) as StockRow[]);
+      try {
+        await loadGroupTrips(userId, id);
+      } catch (tripError) {
+        setMessage(tripError instanceof Error ? tripError.message : "Gruppenfahrten konnten nicht geladen werden.");
+      }
+    }
+  }
+
+  async function createGroupTrip() {
+    if (!userId || !fridgeId) return;
+    if (groupTrips.length > 0) {
+      setMessage("Für diesen Kühlschrank ist bereits eine Gruppenfahrt offen. Bitte diese zuerst abschließen.");
+      return;
+    }
+    if (!newTripName.trim()) {
+      setMessage("Bitte den Namen der Gruppe oder Fahrt eintragen.");
+      return;
+    }
+    if (paymentMethod === "bank" && (!tripStreet.trim() || !tripPostalCode.trim() || !tripCity.trim())) {
+      setMessage("Für eine spätere Rechnung bitte Straße, Postleitzahl und Ort ergänzen.");
+      return;
+    }
+
+    setBusy(true);
+    const { data, error } = await supabase.from("group_sales_trips")
+      .insert({
+        user_id: userId,
+        fridge_id: fridgeId,
+        customer_name: newTripName.trim(),
+        payment_method: paymentMethod,
+        customer_street: paymentMethod === "bank" ? tripStreet.trim() : null,
+        customer_postal_code: paymentMethod === "bank" ? tripPostalCode.trim() : null,
+        customer_city: paymentMethod === "bank" ? tripCity.trim() : null,
+      })
+      .select("id")
+      .single();
+    setBusy(false);
+
+    if (error || !data) {
+      setMessage(`Gruppenfahrt konnte nicht angelegt werden: ${error?.message ?? "Unbekannter Fehler"}`);
+      return;
+    }
+    setNewTripName("");
+    setTripStreet("");
+    setTripPostalCode("");
+    setTripCity("");
+    setSelectedTripId(data.id);
+    setMode("group_sale");
+    setMessage("Gruppenfahrt angelegt. Beim Auffüllen kannst du die Entnahme dazu buchen.");
+    await loadGroupTrips(userId, fridgeId);
+    setSelectedTripId(data.id);
   }
 
   function oldQuantity(productId: string) {
@@ -216,10 +335,42 @@ export default function KuehlschraenkePage() {
       return { product, before, after, difference: before - after };
     });
 
-    const sold = changes.filter((item) => item.difference > 0 && Number(item.product.price) > 0);
+    const consumed = changes.filter((item) => item.difference > 0);
+    const sold = consumed.filter((item) => Number(item.product.price) > 0);
     const total = Math.round(
       sold.reduce((sum, item) => sum + item.difference * Number(item.product.price), 0) * 100
     ) / 100;
+
+    if (mode === "group_sale" && !selectedTrip) {
+      setMessage("Bitte zuerst eine offene Gruppenfahrt auswählen oder anlegen.");
+      setBusy(false);
+      return;
+    }
+
+    if (mode === "group_sale" && consumed.length === 0) {
+      setMessage("Es wurde keine Entnahme erkannt. Prüfe den gezählten Restbestand.");
+      setBusy(false);
+      return;
+    }
+
+    if (mode === "group_sale") {
+      const notCounted = products.filter(
+        (product) => oldQuantity(product.id) > 0 && counted[product.id] === undefined
+      );
+      if (notCounted.length > 0) {
+        setMessage(
+          `Bitte prüfe auch: ${notCounted.slice(0, 4).map((product) => product.name).join(", ")}${notCounted.length > 4 ? " …" : ""}. Für ausverkaufte Getränke trage 0 ein.`
+        );
+        setBusy(false);
+        return;
+      }
+    }
+
+    if (mode === "group_sale" && consumed.some((item) => Number(item.product.price) <= 0)) {
+      setMessage("Mindestens ein entnommenes Getränk hat noch keinen Verkaufspreis im Produktkatalog.");
+      setBusy(false);
+      return;
+    }
 
     if (mode === "sale" && (!customerName.trim() || sold.length === 0)) {
       setMessage(sold.length === 0
@@ -309,6 +460,39 @@ export default function KuehlschraenkePage() {
       return;
     }
 
+    let withdrawalIds: string[] = [];
+    if (mode === "group_sale" && selectedTrip) {
+      const { data: withdrawals, error: withdrawalError } = await supabase
+        .from("group_sales_withdrawals")
+        .insert(consumed.map((item) => ({
+          user_id: userId,
+          trip_id: selectedTrip.id,
+          fridge_id: fridgeId,
+          product_id: item.product.id,
+          product_name: item.product.name,
+          quantity: item.difference,
+          unit_price: Number(item.product.price),
+        })))
+        .select("id");
+
+      if (withdrawalError) {
+        await supabase.from("fridge_stock").upsert(
+          products.map((product) => ({
+            user_id: userId,
+            fridge_id: fridgeId,
+            product_id: product.id,
+            quantity: oldQuantity(product.id),
+            updated_at: new Date().toISOString(),
+          })),
+          { onConflict: "fridge_id,product_id" }
+        );
+        setMessage(`Entnahme konnte nicht zur Gruppenfahrt gespeichert werden: ${withdrawalError.message}`);
+        setBusy(false);
+        return;
+      }
+      withdrawalIds = (withdrawals ?? []).map((row) => row.id);
+    }
+
     const movements = changes
       .filter((item) => item.before !== item.after)
       .map((item) => {
@@ -321,7 +505,7 @@ export default function KuehlschraenkePage() {
         } else if (mode === "private" && item.difference > 0) {
           movementType = "private_withdrawal";
           delta = -item.difference;
-        } else if (mode === "sale" && item.difference > 0) {
+        } else if ((mode === "sale" || mode === "group_sale") && item.difference > 0) {
           movementType = "sale";
           delta = -item.difference;
         } else {
@@ -334,6 +518,7 @@ export default function KuehlschraenkePage() {
           fridge_id: fridgeId,
           product_id: item.product.id,
           booking_id: mode === "sale" && item.difference > 0 ? bookingId : null,
+          group_trip_id: mode === "group_sale" && item.difference > 0 ? selectedTripId : null,
           movement_type: movementType,
           quantity_delta: delta,
         };
@@ -342,6 +527,19 @@ export default function KuehlschraenkePage() {
     if (movements.length) {
       const { error: movementError } = await supabase.from("fridge_stock_movements").insert(movements);
       if (movementError) {
+        if (withdrawalIds.length) {
+          await supabase.from("group_sales_withdrawals").delete().in("id", withdrawalIds);
+          await supabase.from("fridge_stock").upsert(
+            products.map((product) => ({
+              user_id: userId,
+              fridge_id: fridgeId,
+              product_id: product.id,
+              quantity: oldQuantity(product.id),
+              updated_at: new Date().toISOString(),
+            })),
+            { onConflict: "fridge_id,product_id" }
+          );
+        }
         setMessage(`Bestand gespeichert, Bewegungsprotokoll meldet aber: ${movementError.message}`);
         setBusy(false);
         return;
@@ -355,11 +553,109 @@ export default function KuehlschraenkePage() {
       setMessage("Der Bestand wurde gespeichert.");
     } else if (mode === "private") {
       setMessage("Privatentnahme wurde getrennt vom Verkauf im Kühlschrankprotokoll erfasst.");
+    } else if (mode === "group_sale") {
+      await loadGroupTrips(userId, fridgeId);
+      const addedAmount = consumed.reduce(
+        (sum, item) => sum + item.difference * Number(item.product.price),
+        0
+      );
+      setMessage(`${consumed.length} Getränkesorte(n), ${euro.format(addedAmount)} zur Gruppenfahrt „${selectedTrip?.customer_name}“ addiert. Jetzt kannst du den Kühlschrank auffüllen.`);
     } else {
       setMessage(`Verkauf gespeichert. Belegnummer: ${bookingNumber}. Gesamt: ${euro.format(total)}.`);
     }
 
     setBusy(false);
+  }
+
+  async function finishGroupTrip() {
+    if (!userId || !selectedTrip) return;
+    const rows = tripWithdrawals.filter((row) => row.trip_id === selectedTrip.id);
+    if (!rows.length) {
+      setMessage("Für diese Gruppenfahrt wurden noch keine Getränke erfasst.");
+      return;
+    }
+    if (!window.confirm(`Gruppenfahrt „${selectedTrip.customer_name}“ mit ${euro.format(selectedTripTotal)} abschließen und einen gemeinsamen Beleg erstellen?`)) return;
+
+    setBusy(true);
+    setMessage("");
+    const grouped = new Map<string, { productId: string | null; name: string; quantity: number; price: number }>();
+    for (const row of rows) {
+      const key = row.product_id || row.product_name;
+      const item = grouped.get(key) ?? {
+        productId: row.product_id,
+        name: row.product_name,
+        quantity: 0,
+        price: Number(row.unit_price),
+      };
+      item.quantity += Number(row.quantity);
+      grouped.set(key, item);
+    }
+    const items = [...grouped.values()];
+    const total = Math.round(items.reduce((sum, item) => sum + item.quantity * item.price, 0) * 100) / 100;
+    const bookingDate = new Date().toISOString().slice(0, 10);
+    const description = items.map((item) => `${item.name} × ${item.quantity}`).join(", ");
+    const { data: booking, error: bookingError } = await supabase.from("bookings")
+      .insert({
+        user_id: userId,
+        booking_date: bookingDate,
+        type: "income",
+        payment_method: selectedTrip.payment_method,
+        payment_status: selectedTrip.payment_method === "cash" ? "paid" : "open",
+        paid_at: selectedTrip.payment_method === "cash" ? bookingDate : null,
+        description: `Gruppenfahrt ${selectedTrip.customer_name}: ${description}`,
+        amount: total,
+        customer_name: selectedTrip.customer_name,
+        customer_street: selectedTrip.customer_street,
+        customer_postal_code: selectedTrip.customer_postal_code,
+        customer_city: selectedTrip.customer_city,
+      })
+      .select("id,booking_number")
+      .single();
+
+    if (bookingError || !booking) {
+      setBusy(false);
+      setMessage(`Gemeinsamer Beleg konnte nicht erstellt werden: ${bookingError?.message ?? "Unbekannter Fehler"}`);
+      return;
+    }
+
+    const { error: itemsError } = await supabase.from("booking_items").insert(
+      items.map((item) => ({
+        booking_id: booking.id,
+        product_id: item.productId,
+        product_name: item.name,
+        quantity: item.quantity,
+        unit_price: item.price,
+        line_total: Math.round(item.quantity * item.price * 100) / 100,
+      }))
+    );
+
+    if (itemsError) {
+      await supabase.from("bookings").delete().eq("id", booking.id).eq("user_id", userId);
+      setBusy(false);
+      setMessage(`Getränke konnten nicht in den Beleg übernommen werden: ${itemsError.message}`);
+      return;
+    }
+
+    const { error: closeError } = await supabase.from("group_sales_trips")
+      .update({ status: "closed", booking_id: booking.id, closed_at: new Date().toISOString() })
+      .eq("id", selectedTrip.id)
+      .eq("user_id", userId)
+      .eq("status", "open");
+
+    if (closeError) {
+      await supabase.from("booking_items").delete().eq("booking_id", booking.id);
+      await supabase.from("bookings").delete().eq("id", booking.id).eq("user_id", userId);
+      setBusy(false);
+      setMessage(`Gruppenfahrt konnte nicht abgeschlossen werden: ${closeError.message}`);
+      return;
+    }
+
+    const finishedName = selectedTrip.customer_name;
+    setSelectedTripId("");
+    setMode("load");
+    await loadGroupTrips(userId, fridgeId);
+    setBusy(false);
+    setMessage(`Gruppenfahrt „${finishedName}“ abgeschlossen. Beleg ${booking.booking_number}: ${euro.format(total)}.`);
   }
 
   return (
@@ -368,7 +664,7 @@ export default function KuehlschraenkePage() {
         <Link href="/verkauf" className="text-emerald-800 underline">← Zurück zum Verkauf</Link>
         <h1 className="mt-5 text-3xl font-bold">Kühlschrankbestand</h1>
         <p className="mt-2 text-slate-600">
-          Bestand einräumen oder nach der Kundenentnahme den verbliebenen Inhalt scannen.
+          Bestand zählen, Gruppenentnahmen über mehrere Tage sammeln und am Ende gemeinsam abrechnen.
         </p>
 
         <div className="mt-6 grid gap-3 sm:grid-cols-3">
@@ -385,6 +681,104 @@ export default function KuehlschraenkePage() {
           ))}
         </div>
 
+        <section className="mt-5 rounded-xl border border-emerald-200 bg-emerald-50 p-5 shadow-sm">
+          <h2 className="text-xl font-semibold">Mehrtagestour: Gruppenabrechnung</h2>
+          <p className="mt-2 text-sm text-slate-700">
+            Bei jedem Auffüllen den Restbestand scannen. Die Entnahme wird zur selben Gruppenfahrt addiert;
+            am Ende entsteht ein gemeinsamer Beleg.
+          </p>
+
+          {groupTrips.length > 0 && (
+            <div className="mt-4 grid gap-4 sm:grid-cols-[1fr_auto] sm:items-end">
+              <label className="block">
+                <span className="mb-2 block font-medium">Offene Gruppenfahrt</span>
+                <select
+                  value={selectedTripId}
+                  onChange={(event) => setSelectedTripId(event.target.value)}
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-3"
+                >
+                  {groupTrips.map((trip) => (
+                    <option key={trip.id} value={trip.id}>
+                      {trip.customer_name} · {trip.payment_method === "cash" ? "Bar" : "Rechnung"}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                disabled={busy || !selectedTripItems.length}
+                onClick={() => void finishGroupTrip()}
+                className="rounded-lg bg-slate-900 px-4 py-3 font-semibold text-white disabled:opacity-50"
+              >
+                Fahrt abschließen · {euro.format(selectedTripTotal)}
+              </button>
+            </div>
+          )}
+
+          {selectedTrip && (
+            <div className="mt-4 rounded-lg bg-white p-4">
+              <p className="font-semibold">{selectedTrip.customer_name}</p>
+              <p className="text-sm text-slate-600">
+                {selectedTripItems.reduce((sum, row) => sum + Number(row.quantity), 0)} Getränke erfasst · Zwischensumme {euro.format(selectedTripTotal)}
+              </p>
+              {selectedTripItems.length > 0 && (
+                <ul className="mt-2 space-y-1 text-sm">
+                  {[...selectedTripItems.reduce((map, row) => {
+                    const key = row.product_id || row.product_name;
+                    const current = map.get(key) ?? { name: row.product_name, quantity: 0, total: 0 };
+                    current.quantity += Number(row.quantity);
+                    current.total += Number(row.quantity) * Number(row.unit_price);
+                    map.set(key, current);
+                    return map;
+                  }, new Map<string, { name: string; quantity: number; total: number }>()).values()].map((item) => (
+                    <li key={item.name} className="flex justify-between gap-3">
+                      <span>{item.name} × {item.quantity}</span>
+                      <span>{euro.format(item.total)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          <details className="mt-4 rounded-lg bg-white p-4">
+            <summary className="cursor-pointer font-semibold">Neue Gruppenfahrt anlegen</summary>
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <label>
+                <span className="mb-1 block">Gruppe / Kunde</span>
+                <input value={newTripName} onChange={(event) => setNewTripName(event.target.value)}
+                  placeholder="z. B. Reisegruppe Salzburg"
+                  className="w-full rounded-lg border border-slate-300 px-3 py-3" />
+              </label>
+              <label>
+                <span className="mb-1 block">Abrechnung</span>
+                <select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value as "cash" | "bank")}
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-3">
+                  <option value="cash">Barzahlung am Ende</option>
+                  <option value="bank">Rechnung am Ende</option>
+                </select>
+              </label>
+              {paymentMethod === "bank" && (
+                <>
+                  <label><span className="mb-1 block">Straße</span>
+                    <input value={tripStreet} onChange={(event) => setTripStreet(event.target.value)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-3" /></label>
+                  <label><span className="mb-1 block">Postleitzahl</span>
+                    <input value={tripPostalCode} onChange={(event) => setTripPostalCode(event.target.value)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-3" /></label>
+                  <label><span className="mb-1 block">Ort</span>
+                    <input value={tripCity} onChange={(event) => setTripCity(event.target.value)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-3" /></label>
+                </>
+              )}
+              <button type="button" disabled={busy} onClick={() => void createGroupTrip()}
+                className="self-end rounded-lg bg-emerald-700 px-4 py-3 font-semibold text-white disabled:opacity-50">
+                Gruppenfahrt starten
+              </button>
+            </div>
+          </details>
+        </section>
+
         <section className="mt-5 rounded-xl bg-white p-5 shadow-sm">
           <label className="block">
             <span className="mb-2 block font-medium">Vorgang</span>
@@ -392,6 +786,7 @@ export default function KuehlschraenkePage() {
               className="w-full rounded-lg border border-slate-300 bg-white px-3 py-3">
               <option value="load">Bestand einräumen oder zählen</option>
               <option value="sale">Kundenentnahme abrechnen</option>
+              <option value="group_sale">Entnahme zur Gruppenfahrt addieren</option>
               <option value="private">Privatentnahme</option>
             </select>
           </label>
@@ -425,6 +820,14 @@ export default function KuehlschraenkePage() {
                 </>
               )}
             </div>
+          )}
+
+          {mode === "group_sale" && (
+            <p className="mt-4 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-900">
+              {selectedTrip
+                ? `Entnahmen werden zur offenen Fahrt „${selectedTrip.customer_name}“ addiert und noch nicht einzeln verrechnet.`
+                : "Bitte oben eine Gruppenfahrt starten oder auswählen."}
+            </p>
           )}
 
           <div className="mt-5 flex flex-wrap gap-3">
@@ -471,7 +874,7 @@ export default function KuehlschraenkePage() {
                     <strong>{product.name}</strong>
                     <div className="text-sm text-slate-600">
                       Vorher: {before} · gezählt: {after}
-                      {mode === "sale" && removed > 0 && Number(product.price) > 0
+              {(mode === "sale" || mode === "group_sale") && removed > 0 && Number(product.price) > 0
                         ? ` · Entnahme: ${removed} · ${euro.format(removed * Number(product.price))}`
                         : ""}
                     </div>
@@ -493,7 +896,7 @@ export default function KuehlschraenkePage() {
 
           <button type="button" disabled={busy} onClick={() => void save()}
             className="mt-5 rounded-lg bg-emerald-700 px-5 py-3 font-semibold text-white disabled:opacity-50">
-            {busy ? "Speichert …" : mode === "sale" ? "Entnahme abrechnen" : mode === "private" ? "Privatentnahme speichern" : "Bestand speichern"}
+            {busy ? "Speichert …" : mode === "sale" ? "Entnahme abrechnen" : mode === "group_sale" ? "Entnahme zur Fahrt addieren" : mode === "private" ? "Privatentnahme speichern" : "Bestand speichern"}
           </button>
 
           {message && <p role="status" className="mt-4 rounded-lg bg-slate-100 p-3">{message}</p>}
