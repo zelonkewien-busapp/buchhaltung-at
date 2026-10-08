@@ -48,6 +48,14 @@ type TripWithdrawal = {
   unit_price: number | string;
 };
 
+type EditableTripLine = {
+  key: string;
+  productId: string | null;
+  productName: string;
+  quantity: string;
+  unitPrice: string;
+};
+
 export default function KuehlschraenkePage() {
   const [userId, setUserId] = useState("");
   const [products, setProducts] = useState<Product[]>([]);
@@ -70,6 +78,13 @@ export default function KuehlschraenkePage() {
   const [paymentMethod, setPaymentMethod] = useState<"cash" | "bank">("cash");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [editingTrip, setEditingTrip] = useState(false);
+  const [editTripName, setEditTripName] = useState("");
+  const [editTripPaymentMethod, setEditTripPaymentMethod] = useState<"cash" | "bank">("cash");
+  const [editTripStreet, setEditTripStreet] = useState("");
+  const [editTripPostalCode, setEditTripPostalCode] = useState("");
+  const [editTripCity, setEditTripCity] = useState("");
+  const [editTripLines, setEditTripLines] = useState<EditableTripLine[]>([]);
   const [scannerOpen, setScannerOpen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const controlsRef = useRef<{ stop: () => void } | null>(null);
@@ -81,6 +96,21 @@ export default function KuehlschraenkePage() {
     (sum, row) => sum + Number(row.quantity) * Number(row.unit_price),
     0
   );
+  const groupedTripLines = [...selectedTripItems.reduce((map, row) => {
+    const key = row.product_id || row.product_name;
+    const current = map.get(key) ?? {
+      key,
+      productId: row.product_id,
+      productName: row.product_name,
+      quantity: 0,
+      total: 0,
+    };
+    current.quantity += Number(row.quantity);
+    current.total += Number(row.quantity) * Number(row.unit_price);
+    map.set(key, current);
+    return map;
+  }, new Map<string, { key: string; productId: string | null; productName: string; quantity: number; total: number }>()).values()]
+    .map((line) => ({ ...line, unitPrice: line.quantity > 0 ? line.total / line.quantity : 0 }));
 
   async function loadData(id: string) {
     const [productResult, fridgeResult] = await Promise.all([
@@ -561,6 +591,108 @@ export default function KuehlschraenkePage() {
     setBusy(false);
   }
 
+  function beginEditTrip() {
+    if (!selectedTrip) return;
+    setEditTripName(selectedTrip.customer_name);
+    setEditTripPaymentMethod(selectedTrip.payment_method);
+    setEditTripStreet(selectedTrip.customer_street ?? "");
+    setEditTripPostalCode(selectedTrip.customer_postal_code ?? "");
+    setEditTripCity(selectedTrip.customer_city ?? "");
+    setEditTripLines(groupedTripLines.map((line) => ({
+      key: line.key,
+      productId: line.productId,
+      productName: line.productName,
+      quantity: String(line.quantity),
+      unitPrice: String(line.unitPrice),
+    })));
+    setEditingTrip(true);
+    setMessage("");
+  }
+
+  function changeEditTripLine(key: string, changes: Partial<EditableTripLine>) {
+    setEditTripLines((current) => current.map((line) => line.key === key ? { ...line, ...changes } : line));
+  }
+
+  async function saveGroupTripEdits() {
+    if (!userId || !selectedTrip) return;
+    if (!editTripName.trim()) {
+      setMessage("Bitte einen Gruppennamen eintragen.");
+      return;
+    }
+    if (editTripPaymentMethod === "bank" && (!editTripStreet.trim() || !editTripPostalCode.trim() || !editTripCity.trim())) {
+      setMessage("Für die Rechnung bitte Straße, Postleitzahl und Ort ergänzen.");
+      return;
+    }
+
+    const parsedLines = editTripLines.map((line) => ({
+      ...line,
+      quantity: Number(line.quantity),
+      unitPrice: Number(line.unitPrice.replace(",", ".")),
+    }));
+    if (parsedLines.some((line) => !Number.isInteger(line.quantity) || line.quantity < 0 || !Number.isFinite(line.unitPrice) || line.unitPrice < 0)) {
+      setMessage("Bitte nur ganze Mengen ab 0 und gültige Preise ab 0 eingeben.");
+      return;
+    }
+
+    setBusy(true);
+    setMessage("");
+    const originalRows = tripWithdrawals.filter((row) => row.trip_id === selectedTrip.id);
+
+    for (const line of parsedLines) {
+      const matchingRows = originalRows.filter((row) => (row.product_id || row.product_name) === line.key);
+      if (!matchingRows.length) continue;
+
+      const quantities = matchingRows.map((row) => Number(row.quantity));
+      const oldTotal = quantities.reduce((sum, quantity) => sum + quantity, 0);
+      if (line.quantity > oldTotal) quantities[quantities.length - 1] += line.quantity - oldTotal;
+      if (line.quantity < oldTotal) {
+        let toRemove = oldTotal - line.quantity;
+        for (let index = quantities.length - 1; index >= 0 && toRemove > 0; index--) {
+          const removed = Math.min(quantities[index], toRemove);
+          quantities[index] -= removed;
+          toRemove -= removed;
+        }
+      }
+
+      for (let index = 0; index < matchingRows.length; index++) {
+        const row = matchingRows[index];
+        const nextQuantity = quantities[index];
+        const result = nextQuantity === 0
+          ? await supabase.from("group_sales_withdrawals").delete().eq("id", row.id).eq("user_id", userId)
+          : await supabase.from("group_sales_withdrawals").update({
+              quantity: nextQuantity,
+              unit_price: Math.round(line.unitPrice * 100) / 100,
+            }).eq("id", row.id).eq("user_id", userId);
+        if (result.error) {
+          setBusy(false);
+          setMessage(`Getränkemenge konnte nicht vollständig geändert werden: ${result.error.message}`);
+          await loadGroupTrips(userId);
+          return;
+        }
+      }
+    }
+
+    const { error } = await supabase.from("group_sales_trips").update({
+      customer_name: editTripName.trim(),
+      payment_method: editTripPaymentMethod,
+      customer_street: editTripPaymentMethod === "bank" ? editTripStreet.trim() : null,
+      customer_postal_code: editTripPaymentMethod === "bank" ? editTripPostalCode.trim() : null,
+      customer_city: editTripPaymentMethod === "bank" ? editTripCity.trim() : null,
+    }).eq("id", selectedTrip.id).eq("user_id", userId).eq("status", "open");
+
+    if (error) {
+      setBusy(false);
+      setMessage(`Gruppenfahrt konnte nicht gespeichert werden: ${error.message}`);
+      await loadGroupTrips(userId);
+      return;
+    }
+
+    setEditingTrip(false);
+    await loadGroupTrips(userId);
+    setBusy(false);
+    setMessage("Gruppenabrechnung aktualisiert. Die Änderungen gelten für den gemeinsamen Beleg.");
+  }
+
   async function finishGroupTrip() {
     if (!userId || !selectedTrip) return;
     const rows = tripWithdrawals.filter((row) => row.trip_id === selectedTrip.id);
@@ -688,7 +820,10 @@ export default function KuehlschraenkePage() {
                 <span className="mb-2 block font-medium">Offene Gruppenfahrt für alle Kühlschränke</span>
                 <select
                   value={selectedTripId}
-                  onChange={(event) => setSelectedTripId(event.target.value)}
+                  onChange={(event) => {
+                    setSelectedTripId(event.target.value);
+                    setEditingTrip(false);
+                  }}
                   className="w-full rounded-lg border border-slate-300 bg-white px-3 py-3"
                 >
                   {groupTrips.map((trip) => (
@@ -720,23 +855,77 @@ export default function KuehlschraenkePage() {
               <p className="text-sm text-slate-600">
                 {selectedTripItems.reduce((sum, row) => sum + Number(row.quantity), 0)} Getränke erfasst · Zwischensumme {euro.format(selectedTripTotal)}
               </p>
-              {selectedTripItems.length > 0 && (
+              {groupedTripLines.length > 0 && (
                 <ul className="mt-2 space-y-1 text-sm">
-                  {[...selectedTripItems.reduce((map, row) => {
-                    const key = row.product_id || row.product_name;
-                    const current = map.get(key) ?? { name: row.product_name, quantity: 0, total: 0 };
-                    current.quantity += Number(row.quantity);
-                    current.total += Number(row.quantity) * Number(row.unit_price);
-                    map.set(key, current);
-                    return map;
-                  }, new Map<string, { name: string; quantity: number; total: number }>()).values()].map((item) => (
-                    <li key={item.name} className="flex justify-between gap-3">
-                      <span>{item.name} × {item.quantity}</span>
-                      <span>{euro.format(item.total)}</span>
+                  {groupedTripLines.map((item) => (
+                    <li key={item.key} className="flex justify-between gap-3">
+                      <span>{item.productName} × {item.quantity}</span>
+                      <span>{euro.format(item.quantity * item.unitPrice)}</span>
                     </li>
                   ))}
                 </ul>
               )}
+              <button type="button" disabled={busy} onClick={beginEditTrip}
+                className="mt-3 rounded-lg border border-emerald-700 px-4 py-2 font-semibold text-emerald-900 disabled:opacity-50">
+                Gruppenabrechnung bearbeiten
+              </button>
+            </div>
+          )}
+
+          {editingTrip && selectedTrip && (
+            <div className="mt-4 space-y-4 rounded-lg border border-emerald-300 bg-white p-4">
+              <h3 className="font-semibold">Offene Gruppenabrechnung bearbeiten</h3>
+              <p className="text-sm text-slate-600">Die Änderungen gelten für den gemeinsamen Beleg. Der bereits gespeicherte Kühlschrankbestand bleibt unverändert.</p>
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">Gruppe / Kunde</span>
+                <input value={editTripName} onChange={(event) => setEditTripName(event.target.value)}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2" />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">Abrechnung</span>
+                <select value={editTripPaymentMethod} onChange={(event) => setEditTripPaymentMethod(event.target.value as "cash" | "bank")}
+                  className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2">
+                  <option value="cash">Barzahlung am Ende</option>
+                  <option value="bank">Rechnung am Ende</option>
+                </select>
+              </label>
+              {editTripPaymentMethod === "bank" && (
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <label><span className="mb-1 block text-sm">Straße</span>
+                    <input value={editTripStreet} onChange={(event) => setEditTripStreet(event.target.value)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2" /></label>
+                  <label><span className="mb-1 block text-sm">Postleitzahl</span>
+                    <input value={editTripPostalCode} onChange={(event) => setEditTripPostalCode(event.target.value)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2" /></label>
+                  <label><span className="mb-1 block text-sm">Ort</span>
+                    <input value={editTripCity} onChange={(event) => setEditTripCity(event.target.value)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2" /></label>
+                </div>
+              )}
+              <div className="space-y-3">
+                <h4 className="font-medium">Getränke und Preise</h4>
+                {editTripLines.map((line) => (
+                  <div key={line.key} className="grid items-end gap-3 rounded-lg bg-slate-50 p-3 sm:grid-cols-[1fr_140px_160px]">
+                    <strong>{line.productName}</strong>
+                    <label className="text-sm"><span className="mb-1 block">Menge</span>
+                      <input type="number" min="0" step="1" inputMode="numeric" value={line.quantity}
+                        onChange={(event) => changeEditTripLine(line.key, { quantity: event.target.value })}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2" /></label>
+                    <label className="text-sm"><span className="mb-1 block">Einzelpreis (€)</span>
+                      <input type="number" min="0" step="0.01" inputMode="decimal" value={line.unitPrice}
+                        onChange={(event) => changeEditTripLine(line.key, { unitPrice: event.target.value })}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2" /></label>
+                  </div>
+                ))}
+              </div>
+              <div className="flex flex-wrap gap-3">
+                <button type="button" disabled={busy} onClick={() => void saveGroupTripEdits()}
+                  className="rounded-lg bg-emerald-700 px-4 py-2 font-semibold text-white disabled:opacity-50">
+                  {busy ? "Speichert …" : "Änderungen speichern"}
+                </button>
+                <button type="button" disabled={busy} onClick={() => setEditingTrip(false)}
+                  className="rounded-lg border border-slate-400 px-4 py-2 disabled:opacity-50">Abbrechen</button>
+              </div>
             </div>
           )}
 
