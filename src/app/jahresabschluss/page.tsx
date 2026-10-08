@@ -21,6 +21,8 @@ type Booking = {
   document_no: string | null;
   booking_number: string | null;
   customer_name: string | null;
+  source_document_path: string | null;
+  source_document_name: string | null;
 };
 
 type Expense = {
@@ -34,6 +36,7 @@ type Expense = {
   payment_status: "paid" | "open";
   paid_at: string | null;
   created_at: string;
+  storage_path: string | null;
 };
 
 type Product = {
@@ -84,7 +87,14 @@ type InventoryRow = {
 
 type ZipEntry = {
   name: string;
-  content: string;
+  content: string | Uint8Array;
+};
+
+type ReceiptDocument = {
+  kind: "Eingangsbeleg" | "Ausgangsbeleg";
+  date: string;
+  label: string;
+  path: string;
 };
 
 function asNumber(value: number | string | null | undefined) {
@@ -99,6 +109,29 @@ function dateInYear(value: string | null | undefined, year: number) {
 function displayDate(value: string | null | undefined) {
   if (!value) return "–";
   return new Date(`${value.slice(0, 10)}T00:00:00`).toLocaleDateString("de-AT");
+}
+
+function safeFileName(value: string) {
+  return value.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "Beleg";
+}
+
+function fileExtension(path: string, contentType = "") {
+  const match = path.match(/\.[a-zA-Z0-9]{1,8}$/);
+  if (match) return match[0].toLowerCase();
+  if (contentType === "application/pdf") return ".pdf";
+  if (contentType === "image/png") return ".png";
+  if (contentType === "image/webp") return ".webp";
+  if (contentType === "image/jpeg") return ".jpg";
+  return ".bin";
+}
+
+function blobAsDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("Belegbild konnte nicht gelesen werden."));
+    reader.readAsDataURL(blob);
+  });
 }
 
 function effectiveBookingDate(booking: Booking) {
@@ -194,7 +227,7 @@ function makeZip(entries: ZipEntry[]) {
 
   for (const entry of entries) {
     const name = encoder.encode(entry.name);
-    const data = encoder.encode(entry.content);
+    const data = typeof entry.content === "string" ? encoder.encode(entry.content) : entry.content;
     const checksum = crc32(data);
     const local = new Uint8Array(30 + name.length + data.length);
     const localView = new DataView(local.buffer);
@@ -282,7 +315,7 @@ export default function JahresabschlussPage() {
         const { data, error } = await supabase
           .from("bookings")
           .select(
-            "id,booking_date,type,payment_method,payment_status,paid_at,description,amount,document_no,booking_number,customer_name"
+            "id,booking_date,type,payment_method,payment_status,paid_at,description,amount,document_no,booking_number,customer_name,source_document_path,source_document_name"
           )
           .eq("user_id", id)
           .order("booking_date", { ascending: true })
@@ -305,7 +338,7 @@ export default function JahresabschlussPage() {
         const { data, error } = await supabase
           .from("incoming_expenses")
           .select(
-            "id,supplier,invoice_number,invoice_date,total_amount,expense_category,payment_method,payment_status,paid_at,created_at"
+            "id,supplier,invoice_number,invoice_date,total_amount,expense_category,payment_method,payment_status,paid_at,created_at,storage_path"
           )
           .eq("user_id", id)
           .order("created_at", { ascending: true })
@@ -624,7 +657,33 @@ export default function JahresabschlussPage() {
     }
   }
 
-  function downloadPackage() {
+  function annualReceiptDocuments(): ReceiptDocument[] {
+    const incoming: ReceiptDocument[] = expenses
+      .filter((expense) => expense.storage_path)
+      .filter((expense) => dateInYear(expense.invoice_date || expense.created_at, year))
+      .map((expense) => ({
+        kind: "Eingangsbeleg",
+        date: expense.invoice_date || expense.created_at.slice(0, 10),
+        label: `${expense.supplier || "Lieferant"}${expense.invoice_number ? ` – ${expense.invoice_number}` : ""}`,
+        path: expense.storage_path as string,
+      }));
+
+    const outgoing: ReceiptDocument[] = bookings
+      .filter((booking) => booking.type === "income" && booking.source_document_path)
+      .filter((booking) => dateInYear(booking.booking_date, year))
+      .map((booking) => ({
+        kind: "Ausgangsbeleg",
+        date: booking.booking_date,
+        label: `${booking.description || "Verkauf"}${booking.booking_number || booking.document_no ? ` – ${booking.booking_number || booking.document_no}` : ""}${booking.source_document_name ? ` (${booking.source_document_name})` : ""}`,
+        path: booking.source_document_path as string,
+      }));
+
+    return [...incoming, ...outgoing].sort((a, b) =>
+      a.date.localeCompare(b.date) || a.kind.localeCompare(b.kind, "de")
+    );
+  }
+
+  async function downloadPackage() {
     const summary = csvFile([
       ["Jahresabschluss", year],
       ["Betrieb", businessName],
@@ -804,9 +863,34 @@ export default function JahresabschlussPage() {
       `Erstellt: ${new Date().toLocaleString("de-AT")}\r\n\r\n` +
       `Enthalten sind bezahlte Einnahmen und Ausgaben nach dem in der App gespeicherten Zahlungsdatum.\r\n` +
       `Offene Rechnungen sind getrennt aufgeführt und nicht im Ergebnis enthalten.\r\n` +
+      `Alle hinterlegten Ein- und Ausgangsbelege des Jahres liegen zusätzlich im Ordner Belege.\r\n` +
       `Der Inventurbestand enthält Lager und Kühlschränke. Verkaufspreise sind nur Information und keine steuerliche Warenbewertung.\r\n` +
       `Die AfA ist eine lineare Vorschau mit Halbjahresregel. Nutzungsdauer, Sofortabschreibung und Privatanteil bitte mit dem Steuerberater prüfen.\r\n` +
       `Bitte auch Sozialversicherung, Gewinnfreibetrag und sonstige steuerliche Korrekturen prüfen.\r\n`;
+
+    const receiptDocuments = annualReceiptDocuments();
+    const receiptEntries: ZipEntry[] = [];
+    const receiptIndexRows: Array<Array<string | number>> = [["Typ", "Datum", "Beleg", "Datei im ZIP"]];
+    const missingReceipts: string[] = [];
+    for (const [index, receipt] of receiptDocuments.entries()) {
+      const { data, error } = await supabase.storage.from("incoming-invoices").download(receipt.path);
+      if (error || !data) {
+        missingReceipts.push(receipt.label);
+        continue;
+      }
+      const arrayBuffer = await data.arrayBuffer();
+      const archiveName = `Belege/${String(index + 1).padStart(3, "0")}-${receipt.kind === "Eingangsbeleg" ? "Ein" : "Aus"}-${safeFileName(receipt.label)}${fileExtension(receipt.path, data.type)}`;
+      receiptEntries.push({
+        name: archiveName,
+        content: new Uint8Array(arrayBuffer),
+      });
+      receiptIndexRows.push([receipt.kind, receipt.date, receipt.label, archiveName]);
+    }
+    if (missingReceipts.length) {
+      setMessage(`Das Steuerberaterpaket wurde nicht erstellt: ${missingReceipts.length} Beleg(e) konnten nicht geladen werden. Bitte Storage-Zugriff prüfen: ${missingReceipts.slice(0, 3).join(", ")}${missingReceipts.length > 3 ? " …" : ""}`);
+      return;
+    }
+    const receiptIndex = csvFile(receiptIndexRows);
 
     const blob = makeZip([
       { name: `01-Zusammenfassung-${year}.csv`, content: summary },
@@ -816,8 +900,10 @@ export default function JahresabschlussPage() {
       { name: `05-Offene-Posten-${year}.csv`, content: openItemsCsv },
       { name: `06-Wareneingangsbuch-${year}.csv`, content: incomingGoodsCsv },
       { name: `07-Anlagenverzeichnis-${year}.csv`, content: assetsCsv },
+      { name: `08-Belegverzeichnis-${year}.csv`, content: receiptIndex },
       { name: `Jahresuebersicht-${year}.html`, content: html },
       { name: "HINWEISE.txt", content: notes },
+      ...receiptEntries,
     ]);
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -828,6 +914,76 @@ export default function JahresabschlussPage() {
     link.remove();
     URL.revokeObjectURL(url);
     setMessage(`Steuerberaterpaket ${year} wurde heruntergeladen.`);
+  }
+
+  async function printAnnualPackage() {
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      setMessage("Der Druck wurde vom Browser blockiert. Bitte Pop-ups für diese Seite erlauben und erneut auf „Jahresbericht + alle Belege drucken“ tippen.");
+      return;
+    }
+
+    const receipts = annualReceiptDocuments();
+    setBusy(true);
+    setMessage(`Jahresbericht und ${receipts.length} Belege werden für den Druck vorbereitet …`);
+    printWindow.document.open();
+    printWindow.document.write("<!doctype html><html lang=de><meta charset=utf-8><title>Druck wird vorbereitet</title><body style='font:16px Arial;padding:32px'>Belege werden geladen und für den Druck vorbereitet …</body></html>");
+    printWindow.document.close();
+
+    try {
+      const renderedReceipts: string[] = [];
+      const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+      pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+
+      for (const [index, receipt] of receipts.entries()) {
+        setMessage(`Druck wird vorbereitet: Beleg ${index + 1} von ${receipts.length} …`);
+        const { data, error } = await supabase.storage.from("incoming-invoices").download(receipt.path);
+        if (error || !data) throw new Error(`${receipt.label}: ${error?.message || "Datei nicht gefunden"}`);
+
+        const heading = `<h2>${escapeHtml(receipt.kind)} · ${escapeHtml(displayDate(receipt.date))}</h2><p>${escapeHtml(receipt.label)}</p>`;
+        const isPdf = data.type === "application/pdf" || receipt.path.toLowerCase().endsWith(".pdf");
+        if (isPdf) {
+          const pdf = await pdfjs.getDocument({ data: new Uint8Array(await data.arrayBuffer()) }).promise;
+          for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+            const page = await pdf.getPage(pageNumber);
+            const viewport = page.getViewport({ scale: 1.6 });
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.ceil(viewport.width);
+            canvas.height = Math.ceil(viewport.height);
+            const context = canvas.getContext("2d");
+            if (!context) throw new Error(`${receipt.label}: PDF-Seite konnte nicht dargestellt werden.`);
+            await page.render({ canvasContext: context, viewport, canvas } as never).promise;
+            renderedReceipts.push(`<section class="receipt-page">${pageNumber === 1 ? heading : `<h2>${escapeHtml(receipt.kind)} · ${escapeHtml(displayDate(receipt.date))} (Seite ${pageNumber})</h2>`}<img src="${canvas.toDataURL("image/jpeg", 0.88)}" alt="${escapeHtml(receipt.label)}"></section>`);
+          }
+        } else {
+          const dataUrl = await blobAsDataUrl(data);
+          renderedReceipts.push(`<section class="receipt-page">${heading}<img src="${dataUrl}" alt="${escapeHtml(receipt.label)}"></section>`);
+        }
+      }
+
+      const reportRows = annual.expenseGroups
+        .map(([category, total]) => `<tr><td>${escapeHtml(category)}</td><td>${escapeHtml(euro.format(total))}</td></tr>`)
+        .join("");
+      const receiptIndexRows = receipts.length
+        ? receipts.map((receipt) => `<tr><td>${escapeHtml(receipt.kind)}</td><td>${escapeHtml(displayDate(receipt.date))}</td><td>${escapeHtml(receipt.label)}</td></tr>`).join("")
+        : "<tr><td colspan='3'>Für dieses Jahr sind keine Belegdateien hinterlegt.</td></tr>";
+      const report = `<!doctype html><html lang="de"><head><meta charset="utf-8"><title>Jahresabschluss ${year}</title><style>
+        body{font-family:Arial,sans-serif;color:#0f172a;margin:0} .report{padding:24mm 18mm;page-break-after:always}.report-last{page-break-after:auto}h1{margin-bottom:4px}.muted{color:#64748b}table{border-collapse:collapse;width:100%;margin-top:16px}th,td{border:1px solid #cbd5e1;padding:8px;text-align:left}th{background:#f1f5f9}.receipt-page{box-sizing:border-box;min-height:275mm;padding:14mm 12mm;page-break-after:always;break-after:page}.receipt-page:last-child{page-break-after:auto;break-after:auto}.receipt-page img{display:block;max-width:100%;max-height:235mm;margin:12mm auto 0;object-fit:contain}.receipt-page h2{font-size:16px;margin:0}.receipt-page p{margin:5px 0 0;color:#475569}@media print{.no-print{display:none}}@media screen{body{max-width:900px;margin:24px auto}.report,.receipt-page{border:1px solid #cbd5e1;margin-bottom:20px}}
+        </style></head><body><section class="report${receipts.length ? "" : " report-last"}"><button class="no-print" onclick="window.print()">Drucken</button><h1>Jahresübersicht ${year}</h1><p>${escapeHtml(businessName)}</p><p class="muted">Erstellt am ${escapeHtml(new Date().toLocaleString("de-AT"))}</p><table><tbody><tr><th>Bezahlte Betriebseinnahmen</th><td>${escapeHtml(euro.format(annual.incomeTotal))}</td></tr><tr><th>Bezahlte Betriebsausgaben ohne AfA</th><td>${escapeHtml(euro.format(annual.expenseTotal - annual.depreciationTotal))}</td></tr><tr><th>AfA-Vorschau</th><td>${escapeHtml(euro.format(annual.depreciationTotal))}</td></tr><tr><th>Betriebsausgaben inklusive AfA-Vorschau</th><td>${escapeHtml(euro.format(annual.expenseTotal))}</td></tr><tr><th>Vorläufiger Gewinn/Verlust</th><td>${escapeHtml(euro.format(annual.profitTotal))}</td></tr></tbody></table><h2>Ausgaben nach Kategorien</h2><table><thead><tr><th>Kategorie</th><th>Summe</th></tr></thead><tbody>${reportRows || "<tr><td colspan='2'>Keine Ausgaben</td></tr>"}</tbody></table><h2>Belegverzeichnis (${receipts.length})</h2><table><thead><tr><th>Art</th><th>Datum</th><th>Beleg</th></tr></thead><tbody>${receiptIndexRows}</tbody></table></section>${renderedReceipts.join("")}</body></html>`;
+      printWindow.document.open();
+      printWindow.document.write(report);
+      printWindow.document.close();
+      await Promise.all(Array.from(printWindow.document.images).map((image) => image.decode().catch(() => undefined)));
+      printWindow.focus();
+      printWindow.print();
+      setMessage(`Druckansicht bereit: Jahresbericht und ${receipts.length} Belege (${renderedReceipts.length} Seiten) sind enthalten.`);
+    } catch (error) {
+      printWindow.close();
+      const errorMessage = error instanceof Error ? error.message : "Unbekannter Fehler";
+      setMessage(`Druck wurde abgebrochen, damit keine Belege fehlen: ${errorMessage}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   const years = Array.from({ length: 8 }, (_, index) => currentYear - index);
@@ -1097,7 +1253,7 @@ export default function JahresabschlussPage() {
         <section className="mt-6 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 sm:p-6">
           <h2 className="text-xl font-semibold">5. Jahresstand und Export</h2>
           <p className="mt-2 text-slate-600">
-            Speichere zuerst den geprüften Jahresstand und lade anschließend das vollständige ZIP-Paket herunter.
+            Speichere zuerst den geprüften Jahresstand. Danach kannst du den Jahresbericht mit allen hinterlegten Ein- und Ausgangsbelegen in einem Druckdialog ausgeben oder das vollständige ZIP-Paket herunterladen.
           </p>
           {blockingIssueCount > 0 && (
             <p className="mt-4 rounded-xl bg-red-50 p-4 text-red-900">
@@ -1115,8 +1271,17 @@ export default function JahresabschlussPage() {
             </button>
             <button
               type="button"
-              onClick={downloadPackage}
-              className="rounded-xl bg-emerald-700 px-5 py-3 font-semibold text-white"
+              disabled={busy}
+              onClick={() => void printAnnualPackage()}
+              className="rounded-xl bg-emerald-700 px-5 py-3 font-semibold text-white disabled:opacity-50"
+            >
+              Jahresbericht + alle Belege drucken
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void downloadPackage()}
+              className="rounded-xl border border-emerald-700 px-5 py-3 font-semibold text-emerald-800 disabled:opacity-50"
             >
               Steuerberaterpaket als ZIP herunterladen
             </button>
