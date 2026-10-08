@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { BrowserMultiFormatReader } from "@zxing/browser";
+import { createWorker } from "tesseract.js";
 import Link from "next/link";
 import { QRCodeSVG } from "qrcode.react";
 import { createClient } from "@/lib/supabase/client";
@@ -35,6 +36,29 @@ function field(profile: Record<string, unknown> | null, names: string[]) {
   return "";
 }
 
+function parseGermanAmount(value: string): number | null {
+  const cleaned = value
+    .replace(/\s/g, "")
+    .replace(/€|EUR/gi, "")
+    .replace(/\.(?=\d{3}(?:,|$))/g, "")
+    .replace(",", ".");
+  const amount = Number(cleaned);
+  return Number.isFinite(amount) && amount >= 0 ? amount : null;
+}
+
+function findDate(text: string): string {
+  const match = text.match(/\b(\d{1,2})[./-](\d{1,2})[./-](20\d{2})\b/);
+  if (!match) return "";
+  return `${match[3]}-${match[2].padStart(2, "0")}-${match[1].padStart(2, "0")}`;
+}
+
+function findAmount(text: string): string {
+  const matches = [...text.matchAll(/\b\d{1,6}(?:[. ]\d{3})*(?:,\d{2})\s*(?:€|EUR)?/gi)];
+  if (!matches.length) return "";
+  const amount = parseGermanAmount(matches[matches.length - 1][0]);
+  return amount === null ? "" : amount.toFixed(2).replace(".", ",");
+}
+
 export default function VerkaufPage() {
   const [userId, setUserId] = useState("");
   const [products, setProducts] = useState<Product[]>([]);
@@ -58,6 +82,16 @@ export default function VerkaufPage() {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [invoice, setInvoice] = useState<Invoice | null>(null);
+  const [salePdf, setSalePdf] = useState<File | null>(null);
+  const [salePdfText, setSalePdfText] = useState("");
+  const [salePdfDate, setSalePdfDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [salePdfDescription, setSalePdfDescription] = useState("");
+  const [salePdfAmount, setSalePdfAmount] = useState("");
+  const [salePdfCustomer, setSalePdfCustomer] = useState("");
+  const [salePdfPaymentMethod, setSalePdfPaymentMethod] = useState<"cash" | "bank">("cash");
+  const [salePdfPaymentStatus, setSalePdfPaymentStatus] = useState<"paid" | "open">("paid");
+  const [salePdfMessage, setSalePdfMessage] = useState("");
+  const [salePdfBusy, setSalePdfBusy] = useState(false);
 
   useEffect(() => {
     async function load() {
@@ -97,6 +131,144 @@ export default function VerkaufPage() {
 
   function productFor(id: string) {
     return products.find((product) => product.id === id);
+  }
+
+  function chooseSalePdf(file: File | null) {
+    setSalePdf(file);
+    setSalePdfText("");
+    setSalePdfMessage("");
+    setSalePdfAmount("");
+    if (file) {
+      setSalePdfDescription((current) => current || `Verkauf laut PDF: ${file.name.replace(/\.pdf$/i, "")}`);
+    }
+  }
+
+  async function scanSalePdf() {
+    if (!salePdf || salePdf.type !== "application/pdf") {
+      setSalePdfMessage("Bitte zuerst eine PDF-Datei auswählen.");
+      return;
+    }
+    if (salePdf.size > 10 * 1024 * 1024) {
+      setSalePdfMessage("Die PDF darf höchstens 10 MB groß sein.");
+      return;
+    }
+
+    setSalePdfBusy(true);
+    setSalePdfMessage("PDF wird gelesen. Bitte warten …");
+    let worker: Awaited<ReturnType<typeof createWorker>> | null = null;
+
+    try {
+      const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+      pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+      const pdf = await pdfjs.getDocument({ data: new Uint8Array(await salePdf.arrayBuffer()) }).promise;
+      const pageTexts: string[] = [];
+      const pageCount = Math.min(pdf.numPages, 5);
+
+      for (let pageNumber = 1; pageNumber <= pageCount; pageNumber++) {
+        setSalePdfMessage(`PDF wird gelesen: Seite ${pageNumber} von ${pageCount} …`);
+        const page = await pdf.getPage(pageNumber);
+        const content = await page.getTextContent();
+        const embeddedText = content.items.map((item) => ("str" in item ? item.str : "")).join(" ").trim();
+        if (embeddedText.length > 25) {
+          pageTexts.push(embeddedText);
+          continue;
+        }
+
+        if (!worker) worker = await createWorker("deu+eng");
+        const viewport = page.getViewport({ scale: 1.5 });
+        const canvas = window.document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("PDF-Seite konnte nicht verarbeitet werden.");
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        await page.render({ canvas, canvasContext: context, viewport }).promise;
+        const result = await worker.recognize(canvas);
+        pageTexts.push(result.data.text.trim());
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+
+      const text = pageTexts.filter(Boolean).join("\n\n");
+      setSalePdfText(text);
+      const extractedDate = findDate(text);
+      const extractedAmount = findAmount(text);
+      if (extractedDate) setSalePdfDate(extractedDate);
+      if (extractedAmount) setSalePdfAmount(extractedAmount);
+      setSalePdfMessage(text
+        ? "Text erkannt. Datum und Gesamtbetrag bitte prüfen und vor dem Speichern bestätigen."
+        : "Kein Text erkannt. Datum, Beschreibung und Betrag bitte manuell eintragen.");
+    } catch (error) {
+      setSalePdfMessage(error instanceof Error
+        ? `PDF konnte nicht gelesen werden: ${error.message}`
+        : "PDF konnte nicht gelesen werden. Bitte Angaben manuell eintragen.");
+    } finally {
+      if (worker) await worker.terminate();
+      setSalePdfBusy(false);
+    }
+  }
+
+  async function saveSalePdf(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!userId || !salePdf) {
+      setSalePdfMessage("Bitte anmelden und eine PDF-Datei auswählen.");
+      return;
+    }
+    const parsedAmount = parseGermanAmount(salePdfAmount);
+    if (parsedAmount === null || parsedAmount <= 0) {
+      setSalePdfMessage("Bitte einen gültigen Gesamtbetrag größer 0 eingeben.");
+      return;
+    }
+    if (!salePdfDate || !salePdfDescription.trim()) {
+      setSalePdfMessage("Bitte Datum und Verkaufsbeschreibung ergänzen.");
+      return;
+    }
+
+    setSalePdfBusy(true);
+    setSalePdfMessage("PDF und Verkauf werden gespeichert …");
+    const safeName = salePdf.name.replace(/\.pdf$/i, "").replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 60);
+    const storagePath = `${userId}/verkaeufe/${Date.now()}-${safeName || "verkauf"}.pdf`;
+    const { error: uploadError } = await supabase.storage.from("incoming-invoices").upload(storagePath, salePdf, {
+      contentType: "application/pdf",
+      upsert: false,
+    });
+    if (uploadError) {
+      setSalePdfBusy(false);
+      setSalePdfMessage(`PDF konnte nicht gespeichert werden: ${uploadError.message}`);
+      return;
+    }
+
+    const { data: booking, error } = await supabase.from("bookings").insert({
+      user_id: userId,
+      booking_date: salePdfDate,
+      type: "income",
+      payment_method: salePdfPaymentMethod,
+      payment_status: salePdfPaymentStatus,
+      paid_at: salePdfPaymentStatus === "paid" ? salePdfDate : null,
+      description: salePdfDescription.trim(),
+      amount: Math.round(parsedAmount * 100) / 100,
+      customer_name: salePdfCustomer.trim() || null,
+      source_document_path: storagePath,
+      source_document_name: salePdf.name,
+      source_document_ocr_text: salePdfText || null,
+    }).select("booking_number").single();
+
+    if (error || !booking) {
+      await supabase.storage.from("incoming-invoices").remove([storagePath]);
+      setSalePdfBusy(false);
+      setSalePdfMessage(`Verkauf konnte nicht gespeichert werden: ${error?.message ?? "Unbekannter Fehler"}`);
+      return;
+    }
+
+    setSalePdf(null);
+    setSalePdfText("");
+    setSalePdfDate(new Date().toISOString().slice(0, 10));
+    setSalePdfDescription("");
+    setSalePdfAmount("");
+    setSalePdfCustomer("");
+    setSalePdfPaymentMethod("cash");
+    setSalePdfPaymentStatus("paid");
+    setSalePdfBusy(false);
+    setSalePdfMessage(`PDF-Verkauf gespeichert. Belegnummer: ${booking.booking_number}. Die Einnahme erscheint im Jahresabschluss.`);
   }
 
   function lineTotal(line: SaleLine) {
@@ -335,6 +507,75 @@ export default function VerkaufPage() {
           <Link href="/katalog" className="text-emerald-700 underline">Produktkatalog</Link>
         </div>
         <h1 className="mt-6 text-3xl font-bold print:hidden">Verkaufsbeleg erstellen</h1>
+
+        <section className="mt-6 rounded-2xl border border-emerald-200 bg-emerald-50 p-5 shadow-sm print:hidden">
+          <h2 className="text-xl font-semibold">Verkauf aus PDF übernehmen</h2>
+          <p className="mt-2 text-sm text-slate-700">
+            PDF auswählen und Text erkennen lassen. Bitte Datum und Betrag kontrollieren; erst danach wird die Einnahme gespeichert.
+          </p>
+          <form onSubmit={saveSalePdf} className="mt-4 space-y-4">
+            <label className="block">
+              <span className="mb-2 block font-medium">Verkaufsbeleg als PDF (maximal 10 MB)</span>
+              <input type="file" accept="application/pdf,.pdf" required
+                onChange={(event) => chooseSalePdf(event.target.files?.[0] ?? null)}
+                className="w-full rounded-xl border border-slate-300 bg-white p-3" />
+            </label>
+            {salePdf && <p className="text-sm text-slate-600">Ausgewählt: {salePdf.name}</p>}
+            <button type="button" disabled={!salePdf || salePdfBusy} onClick={() => void scanSalePdf()}
+              className="rounded-xl border border-emerald-800 px-5 py-3 font-semibold text-emerald-900 disabled:opacity-50">
+              {salePdfBusy ? "Bitte warten …" : "Text und Betrag aus PDF erkennen"}
+            </button>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="block">
+                <span className="mb-2 block font-medium">Verkaufsdatum</span>
+                <input type="date" required value={salePdfDate} onChange={(event) => setSalePdfDate(event.target.value)}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3" />
+              </label>
+              <label className="block">
+                <span className="mb-2 block font-medium">Gesamtbetrag in Euro</span>
+                <input required inputMode="decimal" value={salePdfAmount} onChange={(event) => setSalePdfAmount(event.target.value)}
+                  placeholder="z. B. 125,50" className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3" />
+              </label>
+              <label className="block sm:col-span-2">
+                <span className="mb-2 block font-medium">Beschreibung</span>
+                <input required value={salePdfDescription} onChange={(event) => setSalePdfDescription(event.target.value)}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3" />
+              </label>
+              <label className="block">
+                <span className="mb-2 block font-medium">Kunde (optional)</span>
+                <input value={salePdfCustomer} onChange={(event) => setSalePdfCustomer(event.target.value)}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3" />
+              </label>
+              <label className="block">
+                <span className="mb-2 block font-medium">Zahlungsart</span>
+                <select value={salePdfPaymentMethod} onChange={(event) => setSalePdfPaymentMethod(event.target.value as "cash" | "bank")}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3">
+                  <option value="cash">Bar</option>
+                  <option value="bank">Bankkonto</option>
+                </select>
+              </label>
+              <label className="block">
+                <span className="mb-2 block font-medium">Zahlungsstatus</span>
+                <select value={salePdfPaymentStatus} onChange={(event) => setSalePdfPaymentStatus(event.target.value as "paid" | "open")}
+                  className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3">
+                  <option value="paid">Bezahlt</option>
+                  <option value="open">Noch offen</option>
+                </select>
+              </label>
+            </div>
+            <button disabled={salePdfBusy || !salePdf}
+              className="rounded-xl bg-emerald-700 px-5 py-3 font-semibold text-white disabled:opacity-50">
+              {salePdfBusy ? "Speichert …" : "PDF als Verkauf speichern"}
+            </button>
+            {salePdfMessage && <p role="status" className="rounded-lg bg-white p-3">{salePdfMessage}</p>}
+            {salePdfText && (
+              <details className="rounded-lg bg-white p-3">
+                <summary className="cursor-pointer font-medium">Erkannten PDF-Text prüfen</summary>
+                <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap text-xs">{salePdfText}</pre>
+              </details>
+            )}
+          </form>
+        </section>
 
         <form onSubmit={saveSale} className="mt-6 space-y-5 rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200 print:hidden">
           <section className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
