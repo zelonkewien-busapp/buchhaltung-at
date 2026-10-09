@@ -26,6 +26,20 @@ type Invoice = {
   items: InvoiceLine[];
   total: number;
 };
+type SavedInvoice = {
+  id: string;
+  number: string;
+  date: string;
+  customerName: string;
+  customerStreet: string;
+  customerPostalCode: string;
+  customerCity: string;
+  customerContact: string;
+  customerCostCenter: string;
+  customerPurchaseOrder: string;
+  description: string;
+  total: number;
+};
 
 function field(profile: Record<string, unknown> | null, names: string[]) {
   if (!profile) return "";
@@ -82,6 +96,8 @@ export default function VerkaufPage() {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [invoice, setInvoice] = useState<Invoice | null>(null);
+  const [savedInvoices, setSavedInvoices] = useState<SavedInvoice[]>([]);
+  const [invoiceListBusy, setInvoiceListBusy] = useState(false);
   const [salePdf, setSalePdf] = useState<File | null>(null);
   const [salePdfText, setSalePdfText] = useState("");
   const [salePdfDate, setSalePdfDate] = useState(() => new Date().toISOString().slice(0, 10));
@@ -102,17 +118,36 @@ export default function VerkaufPage() {
       }
 
       setUserId(auth.user.id);
-      const [{ data: productData, error: productError }, { data: profileData }] = await Promise.all([
+      const [{ data: productData, error: productError }, { data: profileData }, { data: invoiceData, error: invoiceError }] = await Promise.all([
         supabase.from("products").select("id, name, price, barcode")
           .eq("user_id", auth.user.id).eq("is_active", true)
           .not("price", "is", null).order("name"),
         supabase.from("business_profiles").select("*")
           .eq("user_id", auth.user.id).maybeSingle(),
+        supabase.from("bookings")
+          .select("id,booking_number,booking_date,customer_name,customer_street,customer_postal_code,customer_city,customer_contact,customer_cost_center,customer_purchase_order,description,amount")
+          .eq("user_id", auth.user.id).eq("type", "income").eq("payment_method", "bank")
+          .not("customer_name", "is", null).order("booking_date", { ascending: false }).limit(50),
       ]);
 
       if (productError) setMessage(`Artikel konnten nicht geladen werden: ${productError.message}`);
+      if (invoiceError) setMessage(`Rechnungen konnten nicht geladen werden: ${invoiceError.message}`);
       setProducts((productData ?? []) as Product[]);
       setProfile((profileData ?? null) as Record<string, unknown> | null);
+      setSavedInvoices((invoiceData ?? []).map((row) => ({
+        id: row.id,
+        number: row.booking_number || row.id.slice(0, 8),
+        date: row.booking_date,
+        customerName: row.customer_name || "",
+        customerStreet: row.customer_street || "",
+        customerPostalCode: row.customer_postal_code || "",
+        customerCity: row.customer_city || "",
+        customerContact: row.customer_contact || "",
+        customerCostCenter: row.customer_cost_center || "",
+        customerPurchaseOrder: row.customer_purchase_order || "",
+        description: row.description || "",
+        total: Number(row.amount) || 0,
+      })) as SavedInvoice[]);
     }
 
     void load();
@@ -463,7 +498,7 @@ export default function VerkaufPage() {
     }
 
     if (paymentMethod === "bank") {
-      setInvoice({
+      const createdInvoice: Invoice = {
         number: booking.booking_number,
         date: new Date().toLocaleDateString("de-AT"),
         customerName: customerName.trim(),
@@ -480,7 +515,22 @@ export default function VerkaufPage() {
           total: line.line_total,
         })),
         total,
-      });
+      };
+      setInvoice(createdInvoice);
+      setSavedInvoices((current) => [{
+        id: booking.id,
+        number: booking.booking_number,
+        date: bookingDate,
+        customerName: customerName.trim(),
+        customerStreet: customerStreet.trim(),
+        customerPostalCode: customerPostalCode.trim(),
+        customerCity: customerCity.trim(),
+        customerContact: customerContact.trim(),
+        customerCostCenter: customerCostCenter.trim(),
+        customerPurchaseOrder: customerPurchaseOrder.trim(),
+        description: `Verkauf: ${description}`,
+        total,
+      }, ...current.filter((item) => item.id !== booking.id)].slice(0, 50));
       setMessage(
         "Rechnung erstellt und als offen gespeichert. Nach Zahlungseingang kannst du sie im Jahresabschluss als bezahlt markieren."
       );
@@ -491,6 +541,41 @@ export default function VerkaufPage() {
     setLines([{ key: nextKey, productId: "", quantity: "1" }]);
     setNextKey((value) => value + 1);
     setBusy(false);
+  }
+
+  async function openSavedInvoice(saved: SavedInvoice) {
+    if (invoiceListBusy) return;
+    setInvoiceListBusy(true);
+    setMessage("");
+    const { data: itemRows, error } = await supabase.from("booking_items")
+      .select("product_name,quantity,unit_price,line_total")
+      .eq("booking_id", saved.id);
+    setInvoiceListBusy(false);
+    if (error) {
+      setMessage(`Rechnung konnte nicht geöffnet werden: ${error.message}`);
+      return;
+    }
+
+    const items = (itemRows ?? []).map((item) => ({
+      name: item.product_name,
+      quantity: Number(item.quantity),
+      price: Number(item.unit_price),
+      total: Number(item.line_total),
+    }));
+    setInvoice({
+      number: saved.number,
+      date: new Date(`${saved.date}T00:00:00`).toLocaleDateString("de-AT"),
+      customerName: saved.customerName,
+      customerStreet: saved.customerStreet,
+      customerPostalCode: saved.customerPostalCode,
+      customerCity: saved.customerCity,
+      customerContact: saved.customerContact,
+      customerCostCenter: saved.customerCostCenter,
+      customerPurchaseOrder: saved.customerPurchaseOrder,
+      items: items.length ? items : [{ name: saved.description || "Verkauf", quantity: 1, price: saved.total, total: saved.total }],
+      total: saved.total,
+    });
+    window.setTimeout(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" }), 50);
   }
 
   const qrText = invoice && iban
@@ -507,6 +592,28 @@ export default function VerkaufPage() {
           <Link href="/katalog" className="text-emerald-700 underline">Produktkatalog</Link>
         </div>
         <h1 className="mt-6 text-3xl font-bold print:hidden">Verkaufsbeleg erstellen</h1>
+
+        <section className="mt-6 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 print:hidden">
+          <h2 className="text-xl font-semibold">Deine Rechnungen</h2>
+          <p className="mt-1 text-sm text-slate-600">Die letzten 50 gespeicherten Kundenrechnungen. Öffne eine Rechnung, um sie erneut aufzurufen und zu drucken oder zu teilen.</p>
+          {savedInvoices.length === 0 ? (
+            <p className="mt-3 rounded-lg bg-slate-50 p-3 text-sm text-slate-600">Noch keine gespeicherten Kundenrechnungen vorhanden.</p>
+          ) : (
+            <div className="mt-3 space-y-2">
+              {savedInvoices.map((saved) => (
+                <article key={saved.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 p-3">
+                  <div>
+                    <p className="font-semibold">{saved.customerName} · Rechnung {saved.number}</p>
+                    <p className="text-sm text-slate-600">{new Date(`${saved.date}T00:00:00`).toLocaleDateString("de-AT")} · {euro.format(saved.total)}{saved.customerPurchaseOrder ? ` · Bestellnummer ${saved.customerPurchaseOrder}` : ""}</p>
+                  </div>
+                  <button type="button" disabled={invoiceListBusy} onClick={() => void openSavedInvoice(saved)} className="rounded-lg border border-emerald-700 px-4 py-2 font-semibold text-emerald-900 disabled:opacity-50">
+                    {invoiceListBusy ? "Lädt …" : "Rechnung öffnen"}
+                  </button>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
 
         <section className="mt-6 rounded-2xl border border-emerald-200 bg-emerald-50 p-5 shadow-sm print:hidden">
           <h2 className="text-xl font-semibold">Verkauf aus PDF übernehmen</h2>
@@ -806,8 +913,9 @@ export default function VerkaufPage() {
 
             <button onClick={() => window.print()}
               className="mt-8 rounded-xl bg-emerald-700 px-5 py-3 font-semibold text-white print:hidden">
-              Rechnung drucken oder als PDF speichern
+              Rechnung drucken / PDF öffnen und teilen
             </button>
+            <p className="mt-2 text-sm text-slate-600 print:hidden">Am iPhone: Druckvorschau öffnen, dann über das Teilen-Symbol „Mail“ oder „In Dateien sichern“ wählen.</p>
           </section>
         )}
       </div>
