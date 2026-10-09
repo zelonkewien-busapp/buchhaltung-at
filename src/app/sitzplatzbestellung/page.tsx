@@ -11,6 +11,7 @@ const euro = new Intl.NumberFormat("de-AT", { style: "currency", currency: "EUR"
 type Fridge = { id: string; name: string };
 type Trip = { id: string; customer_name: string; fridge_id: string; opened_at: string };
 type Seat = { id: string; trip_id: string; seat_number: number; access_token: string };
+type SeatCode = { id: string; seat_number: number; access_token: string };
 type SeatOrder = {
   id: string;
   trip_id: string;
@@ -52,6 +53,7 @@ export default function SitzplatzbestellungPage() {
   const [fridges, setFridges] = useState<Fridge[]>([]);
   const [trips, setTrips] = useState<Trip[]>([]);
   const [seats, setSeats] = useState<Seat[]>([]);
+  const [seatCodes, setSeatCodes] = useState<SeatCode[]>([]);
   const [orders, setOrders] = useState<SeatOrder[]>([]);
   const [selectedTripId, setSelectedTripId] = useState("");
   const [tripName, setTripName] = useState("");
@@ -64,7 +66,7 @@ export default function SitzplatzbestellungPage() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
-  const loadTrips = useCallback(async (id: string) => {
+  const loadTrips = useCallback(async (id: string, preferredTripId?: string) => {
     const { data, error } = await supabase.from("group_sales_trips")
       .select("id,customer_name,fridge_id,opened_at")
       .eq("user_id", id)
@@ -73,8 +75,12 @@ export default function SitzplatzbestellungPage() {
     if (error) throw error;
     const list = (data ?? []) as Trip[];
     setTrips(list);
-    setSelectedTripId((current) => list.some((trip) => trip.id === current) ? current : list[0]?.id ?? "");
-  }, []);
+    const chosenTrip = list.find((trip) => trip.id === preferredTripId)
+      ?? list.find((trip) => trip.id === selectedTripId)
+      ?? list[0];
+    setSelectedTripId(chosenTrip?.id ?? "");
+    if (chosenTrip) await supabase.rpc("activate_seat_order_trip", { p_trip_id: chosenTrip.id });
+  }, [selectedTripId]);
 
   const loadTripData = useCallback(async (tripId: string) => {
     if (!tripId) { setSeats([]); setOrders([]); return; }
@@ -94,11 +100,22 @@ export default function SitzplatzbestellungPage() {
     setOrders((orderRows ?? []) as SeatOrder[]);
   }, []);
 
+  const loadSeatCodes = useCallback(async (count = 36) => {
+    const { error: ensureError } = await supabase.rpc("ensure_seat_order_codes", { p_count: count });
+    if (ensureError) throw ensureError;
+    const { data, error } = await supabase.from("group_sales_seat_codes")
+      .select("id,seat_number,access_token").order("seat_number");
+    if (error) throw error;
+    setSeatCodes((data ?? []) as SeatCode[]);
+  }, []);
+
   useEffect(() => {
     async function start() {
       const { data, error } = await supabase.auth.getUser();
       if (error || !data.user) { setMessage("Bitte zuerst anmelden."); return; }
       setUserId(data.user.id);
+      try { await loadSeatCodes(); }
+      catch (error) { setMessage(error instanceof Error ? error.message : "Dauerhafte Sitzplatz-Codes konnten nicht geladen werden."); }
       const { data: fridgeRows, error: fridgeError } = await supabase.from("fridges")
         .select("id,name").eq("user_id", data.user.id).order("name");
       if (fridgeError) { setMessage(fridgeError.message); return; }
@@ -109,7 +126,7 @@ export default function SitzplatzbestellungPage() {
       catch (error) { setMessage(error instanceof Error ? error.message : "Fahrten konnten nicht geladen werden."); }
     }
     void start();
-  }, [loadTrips]);
+  }, [loadSeatCodes, loadTrips]);
 
   useEffect(() => {
     void loadTripData(selectedTripId).catch((error) => {
@@ -125,9 +142,6 @@ export default function SitzplatzbestellungPage() {
     return map;
   }, [orders]);
   const total = orders.reduce((sum, order) => sum + order.quantity * Number(order.unit_price), 0);
-  const loungeSeats = seats.filter((seat) => seat.seat_number <= 4);
-  const standardSeats = seats.filter((seat) => seat.seat_number > 4);
-
   async function createTrip() {
     if (!userId || !fridgeId || busy) return;
     const count = Number(seatCount);
@@ -138,6 +152,8 @@ export default function SitzplatzbestellungPage() {
     }
     setBusy(true);
     setMessage("");
+    try { await loadSeatCodes(count); }
+    catch (error) { setBusy(false); setMessage(`Dauerhafte QR-Codes konnten nicht vorbereitet werden: ${error instanceof Error ? error.message : "unbekannter Fehler"}`); return; }
     const { data: trip, error: tripError } = await supabase.from("group_sales_trips")
       .insert({
         user_id: userId,
@@ -160,8 +176,12 @@ export default function SitzplatzbestellungPage() {
       await supabase.from("group_sales_trips").delete().eq("id", trip.id).eq("user_id", userId);
       setBusy(false); setMessage(`Sitzplätze konnten nicht angelegt werden: ${seatError.message}. Bitte zuerst die SQL-Datei im Supabase SQL Editor ausführen.`); return;
     }
+    const { error: activateError } = await supabase.rpc("activate_seat_order_trip", { p_trip_id: trip.id });
+    if (activateError) {
+      setBusy(false); setMessage(`Fahrt angelegt, konnte aber nicht für Sitzplatzbestellungen aktiviert werden: ${activateError.message}`); return;
+    }
     setTripName("");
-    await loadTrips(userId);
+    await loadTrips(userId, trip.id);
     setSelectedTripId(trip.id);
     await loadTripData(trip.id);
     setBusy(false);
@@ -178,6 +198,14 @@ export default function SitzplatzbestellungPage() {
   }
 
   function printSeatCodes() { window.print(); }
+
+  async function selectTrip(tripId: string) {
+    setSelectedTripId(tripId);
+    if (!tripId) return;
+    const { error } = await supabase.rpc("activate_seat_order_trip", { p_trip_id: tripId });
+    if (error) setMessage(`Fahrt konnte nicht für die QR-Codes aktiviert werden: ${error.message}`);
+    else setMessage("Diese Fahrt ist jetzt mit den dauerhaft angebrachten Sitzplatz-QR-Codes verbunden.");
+  }
 
   return (
     <main className="min-h-screen bg-slate-50 px-4 py-8 text-slate-900">
@@ -220,18 +248,18 @@ export default function SitzplatzbestellungPage() {
           <section className="mt-5 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
             <div className="flex flex-wrap items-end justify-between gap-4">
               <label className="min-w-64 flex-1 text-sm font-medium">Offene Fahrt
-                <select value={selectedTripId} onChange={(event) => setSelectedTripId(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-3 text-base">
+                <select value={selectedTripId} onChange={(event) => void selectTrip(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-3 text-base">
                   <option value="">Fahrt auswählen</option>
                   {trips.map((trip) => <option value={trip.id} key={trip.id}>{trip.customer_name}</option>)}
                 </select>
               </label>
-              <button type="button" disabled={!selectedTrip || seats.length === 0} onClick={printSeatCodes} className="rounded-xl border border-emerald-700 px-5 py-3 font-bold text-emerald-900 disabled:opacity-50">QR-Codes drucken</button>
+              <button type="button" disabled={seatCodes.length === 0} onClick={printSeatCodes} className="rounded-xl border border-emerald-700 px-5 py-3 font-bold text-emerald-900 disabled:opacity-50">Dauerhafte QR-Codes drucken</button>
             </div>
             {selectedTrip && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-emerald-50 p-4">
               <div><strong>{selectedTrip.customer_name}</strong><p className="text-sm text-slate-700">{seats.length} Plätze · {orders.length} aktive Bestellpositionen</p></div>
               <div className="text-right"><strong className="text-xl">{euro.format(total)}</strong><p className="text-sm text-slate-600">offene Gesamtsumme</p></div>
             </div>}
-            <p className="mt-4 rounded-lg bg-slate-100 p-3 text-sm text-slate-700">Die QR-Codes funktionieren nur während der offenen Fahrt. Ein Scan öffnet die Getränkekarte für genau diesen Platz. Bestellung und Bestand werden erst nach Bestätigung geändert.</p>
+            <p className="mt-4 rounded-lg bg-slate-100 p-3 text-sm text-slate-700">Diese QR-Codes bleiben immer gleich und werden einmal ausgedruckt. Wähle hier die aktive Fahrt aus: Bestellungen der festen Sitzplatz-Codes werden dann dieser Fahrt zugeordnet. Ohne aktive Fahrt können Gäste nicht bestellen.</p>
           </section>
 
           {selectedTrip && <section className="mt-5 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
@@ -258,22 +286,22 @@ export default function SitzplatzbestellungPage() {
           {message && <p role="status" className="mt-4 rounded-xl bg-white p-3 shadow-sm">{message}</p>}
         </div>
 
-        {selectedTrip && seats.length > 0 && <section className="seat-print-area mt-8 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+        {seatCodes.length > 0 && <section className="seat-print-area mt-8 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
           <header className="seat-print-header mb-5">
             <p className="text-sm font-semibold uppercase tracking-wide text-emerald-700">Sitzplatz-QR-Codes</p>
-            <h2 className="text-2xl font-bold">{selectedTrip.customer_name}</h2>
-            <p className="text-sm text-slate-600">Ausschneiden und am jeweiligen Sitzplatz anbringen.</p>
+            <h2 className="text-2xl font-bold">Dauerhafte Codes · {seatCodes.length} Sitzplätze</h2>
+            <p className="text-sm text-slate-600">Einmal ausdrucken und dauerhaft am jeweiligen Sitzplatz anbringen. Die Codes gelten für die jeweils aktive Fahrt.</p>
           </header>
           <div className="mb-4 rounded-xl border border-slate-200 p-3">
             <p className="mb-3 text-center text-xs font-bold uppercase tracking-wide text-slate-500">Vorne · Tisch-/Loungebereich</p>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              {loungeSeats.map((seat) => <SeatQr key={seat.id} token={seat.access_token} seatNumber={seat.seat_number} />)}
+              {seatCodes.filter((seat) => seat.seat_number <= 4).map((seat) => <SeatQr key={seat.id} token={seat.access_token} seatNumber={seat.seat_number} />)}
             </div>
           </div>
           <p className="mb-3 text-center text-xs font-bold uppercase tracking-wide text-slate-500">Fahrgastraum · Blickrichtung nach vorne ↑</p>
           <div className="space-y-3">
-            {Array.from({ length: Math.ceil(standardSeats.length / 4) }, (_, rowIndex) => {
-              const row = standardSeats.slice(rowIndex * 4, rowIndex * 4 + 4);
+            {Array.from({ length: Math.ceil(seatCodes.filter((seat) => seat.seat_number > 4).length / 4) }, (_, rowIndex) => {
+              const row = seatCodes.filter((seat) => seat.seat_number > 4).slice(rowIndex * 4, rowIndex * 4 + 4);
               return <div key={rowIndex} className="seat-row grid grid-cols-[1fr_1fr_0.25fr_1fr_1fr] gap-2">
                 {row.slice(0, 2).map((seat) => <SeatQr key={seat.id} token={seat.access_token} seatNumber={seat.seat_number} />)}
                 <div aria-hidden="true" className="flex items-center justify-center text-[10px] text-slate-400">Gang</div>

@@ -15,6 +15,58 @@ create table if not exists public.group_sales_seats (
 create index if not exists group_sales_seats_trip_idx
   on public.group_sales_seats(trip_id, seat_number);
 
+-- Dauerhafte Codes: einmal gedruckt, bei jeder Fahrt wiederverwendbar.
+create table if not exists public.group_sales_seat_codes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  seat_number integer not null check (seat_number between 1 and 60),
+  access_token uuid not null unique default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  unique (user_id, seat_number)
+);
+
+alter table public.group_sales_trips
+  add column if not exists seat_orders_active boolean not null default false;
+
+alter table public.group_sales_seat_codes enable row level security;
+drop policy if exists "group_sales_seat_codes_owner_select" on public.group_sales_seat_codes;
+create policy "group_sales_seat_codes_owner_select"
+  on public.group_sales_seat_codes for select to authenticated
+  using (user_id = auth.uid());
+grant select on public.group_sales_seat_codes to authenticated;
+
+create or replace function public.ensure_seat_order_codes(p_count integer default 36)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is null then raise exception 'Fahrer-Anmeldung erforderlich.'; end if;
+  if p_count < 4 or p_count > 60 then raise exception 'Sitzplatzzahl muss zwischen 4 und 60 liegen.'; end if;
+  insert into public.group_sales_seat_codes(user_id, seat_number)
+  select auth.uid(), n from generate_series(1, p_count) n
+  on conflict (user_id, seat_number) do nothing;
+end;
+$$;
+
+create or replace function public.activate_seat_order_trip(p_trip_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is null then raise exception 'Fahrer-Anmeldung erforderlich.'; end if;
+  if not exists (select 1 from public.group_sales_trips where id = p_trip_id and user_id = auth.uid() and status = 'open') then
+    raise exception 'Die Fahrt ist nicht offen oder gehört nicht zu deinem Konto.';
+  end if;
+  update public.group_sales_trips set seat_orders_active = false
+   where user_id = auth.uid() and seat_orders_active;
+  update public.group_sales_trips set seat_orders_active = true where id = p_trip_id;
+end;
+$$;
+
 create table if not exists public.group_sales_seat_orders (
   id uuid primary key default gen_random_uuid(),
   trip_id uuid not null references public.group_sales_trips(id) on delete cascade,
@@ -72,9 +124,11 @@ begin
   select s.id as seat_id, s.seat_number, t.id as trip_id, t.customer_name,
          t.fridge_id, t.user_id, t.status
     into v_seat
-    from public.group_sales_seats s
-    join public.group_sales_trips t on t.id = s.trip_id
-   where s.access_token = p_token;
+    from public.group_sales_seat_codes c
+    join public.group_sales_trips t on t.user_id = c.user_id
+      and t.status = 'open' and t.seat_orders_active
+    join public.group_sales_seats s on s.trip_id = t.id and s.seat_number = c.seat_number
+   where c.access_token = p_token;
 
   if not found or v_seat.status <> 'open' then
     raise exception 'Diese Fahrt oder dieser Sitzplatz ist nicht mehr aktiv.';
@@ -146,9 +200,11 @@ begin
   select s.id as seat_id, s.seat_number, t.id as trip_id, t.fridge_id,
          t.user_id, t.status
     into v_seat
-    from public.group_sales_seats s
-    join public.group_sales_trips t on t.id = s.trip_id
-   where s.access_token = p_token
+    from public.group_sales_seat_codes c
+    join public.group_sales_trips t on t.user_id = c.user_id
+      and t.status = 'open' and t.seat_orders_active
+    join public.group_sales_seats s on s.trip_id = t.id and s.seat_number = c.seat_number
+   where c.access_token = p_token
    for update of t;
 
   if not found or v_seat.status <> 'open' then
@@ -277,3 +333,7 @@ revoke all on function public.cancel_seat_order(uuid) from public;
 grant execute on function public.get_seat_order_menu(uuid) to anon, authenticated;
 grant execute on function public.submit_seat_order(uuid, jsonb) to anon, authenticated;
 grant execute on function public.cancel_seat_order(uuid) to authenticated;
+revoke all on function public.ensure_seat_order_codes(integer) from public;
+revoke all on function public.activate_seat_order_trip(uuid) from public;
+grant execute on function public.ensure_seat_order_codes(integer) to authenticated;
+grant execute on function public.activate_seat_order_trip(uuid) to authenticated;
