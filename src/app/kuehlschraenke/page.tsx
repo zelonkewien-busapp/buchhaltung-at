@@ -11,8 +11,11 @@ const euro = new Intl.NumberFormat("de-AT", { style: "currency", currency: "EUR"
 type Product = {
   id: string;
   name: string;
+  category: string;
+  unit: string;
   price: number | string | null;
   barcode: string | null;
+  stock: number | string;
 };
 
 type Fridge = {
@@ -56,6 +59,13 @@ type EditableTripLine = {
   unitPrice: string;
 };
 
+type PhotoRecommendation = {
+  productId: string;
+  productName: string;
+  quantity: number;
+  confidence: number;
+};
+
 export default function KuehlschraenkePage() {
   const [userId, setUserId] = useState("");
   const [products, setProducts] = useState<Product[]>([]);
@@ -86,6 +96,10 @@ export default function KuehlschraenkePage() {
   const [editTripCity, setEditTripCity] = useState("");
   const [editTripLines, setEditTripLines] = useState<EditableTripLine[]>([]);
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [stockPhoto, setStockPhoto] = useState<string | null>(null);
+  const [stockPhotoFile, setStockPhotoFile] = useState<File | null>(null);
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const [photoRecommendations, setPhotoRecommendations] = useState<PhotoRecommendation[]>([]);
   const videoRef = useRef<HTMLVideoElement>(null);
   const controlsRef = useRef<{ stop: () => void } | null>(null);
   const lastScanRef = useRef({ code: "", time: 0 });
@@ -115,7 +129,7 @@ export default function KuehlschraenkePage() {
   async function loadData(id: string) {
     const [productResult, fridgeResult] = await Promise.all([
       supabase.from("products")
-        .select("id,name,price,barcode")
+        .select("id,name,category,unit,price,barcode,stock")
         .eq("user_id", id)
         .eq("is_active", true)
         .order("name"),
@@ -129,7 +143,7 @@ export default function KuehlschraenkePage() {
     if (fridgeResult.error) throw fridgeResult.error;
 
     let fridgeList = (fridgeResult.data ?? []) as Fridge[];
-    const standardNames = ["Kühlschrank 1", "Kühlschrank 2", "Kühlschrank 3"];
+    const standardNames = ["Kühlschrank 1", "Kühlschrank 2", "Kühlschrank 3", "Kaffee"];
     const missing = standardNames.filter((name) => !fridgeList.some((item) => item.name === name));
 
     if (missing.length) {
@@ -211,6 +225,7 @@ export default function KuehlschraenkePage() {
   async function changeFridge(id: string) {
     setFridgeId(id);
     setCounted({});
+    setPhotoRecommendations([]);
     if (!userId) return;
 
     const { data, error } = await supabase.from("fridge_stock")
@@ -277,6 +292,83 @@ export default function KuehlschraenkePage() {
 
   function currentQuantity(productId: string) {
     return Number(counted[productId] ?? 0);
+  }
+
+  const isCoffeeLocation = fridges.find((fridge) => fridge.id === fridgeId)?.name === "Kaffee";
+  const visibleProducts = products.filter((product) => {
+    if (isCoffeeLocation) {
+      const isCoffeeItem = product.category === "Heißgetränk" || product.unit === "Tasse" ||
+        /kaffee|becher/i.test(product.name);
+      return isCoffeeItem;
+    }
+    return Number(product.stock) > 0 || oldQuantity(product.id) > 0;
+  });
+
+  async function handleStockPhoto(file?: File) {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setMessage("Bitte ein Bild auswählen.");
+      return;
+    }
+
+    try {
+      const sourceUrl = URL.createObjectURL(file);
+      const image = new Image();
+      image.src = sourceUrl;
+      await image.decode();
+      const scale = Math.min(1, 1600 / Math.max(image.naturalWidth, image.naturalHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Bild konnte nicht vorbereitet werden.");
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(sourceUrl);
+
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.82));
+      if (!blob) throw new Error("Bild konnte nicht verkleinert werden.");
+      const resized = new File([blob], "kuehlschrankfoto.jpg", { type: "image/jpeg" });
+      setStockPhoto((current) => {
+        if (current) URL.revokeObjectURL(current);
+        return URL.createObjectURL(resized);
+      });
+      setStockPhotoFile(resized);
+      setPhotoRecommendations([]);
+      setMessage("Foto bereit. Tippe auf „Foto automatisch zählen“, um einen KI-Zählvorschlag zu erstellen.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Foto konnte nicht verarbeitet werden.");
+    }
+  }
+
+  async function countStockPhoto() {
+    if (!stockPhotoFile || photoBusy) return;
+    setPhotoBusy(true);
+    setMessage("Das Foto wird analysiert …");
+
+    try {
+      const formData = new FormData();
+      formData.set("image", stockPhotoFile);
+      formData.set("productIds", JSON.stringify(visibleProducts.map((product) => product.id)));
+      const response = await fetch("/api/stock-photo-count", { method: "POST", body: formData });
+      const result = await response.json() as { items?: PhotoRecommendation[]; error?: string };
+      if (!response.ok) throw new Error(result.error || "Foto konnte nicht gezählt werden.");
+
+      const items = result.items ?? [];
+      setPhotoRecommendations(items);
+      setCounted((current) => ({
+        ...current,
+        ...Object.fromEntries(items
+          .filter((item) => item.confidence >= 0.35)
+          .map((item) => [item.productId, String(item.quantity)])),
+      }));
+      setMessage(items.length
+        ? "Zählvorschlag erstellt. Bitte alle Mengen unten mit dem Foto abgleichen; unsichere Erkennungen bleiben leer."
+        : "Auf dem Foto wurde kein Produkt sicher erkannt. Bitte zähle die Mengen manuell.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Fotoanalyse fehlgeschlagen.");
+    } finally {
+      setPhotoBusy(false);
+    }
   }
 
   function changeCount(productId: string, value: string) {
@@ -793,7 +885,7 @@ export default function KuehlschraenkePage() {
           Bestand zählen, Gruppenentnahmen über mehrere Tage sammeln und am Ende gemeinsam abrechnen.
         </p>
 
-        <div className="mt-6 grid gap-3 sm:grid-cols-3">
+        <div className="mt-6 grid gap-3 sm:grid-cols-4">
           {fridges.map((fridge) => (
             <button key={fridge.id} onClick={() => void changeFridge(fridge.id)}
               className={`rounded-xl border p-4 text-left font-semibold ${
@@ -968,6 +1060,11 @@ export default function KuehlschraenkePage() {
         </section>
 
         <section className="mt-5 rounded-xl bg-white p-5 shadow-sm">
+          {isCoffeeLocation && (
+            <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-950">
+              Kaffee-Becher zählen: Hier erscheinen Katalogartikel der Kategorie „Heißgetränk“, Produkte mit der Einheit „Tasse“ sowie Artikel mit „Kaffee“ oder „Becher“ im Namen.
+            </p>
+          )}
           <label className="block">
             <span className="mb-2 block font-medium">Vorgang</span>
             <select value={mode} onChange={(event) => setMode(event.target.value as Mode)}
@@ -1029,7 +1126,43 @@ export default function KuehlschraenkePage() {
             <Link href="/katalog" className="rounded-lg border border-slate-400 px-4 py-3">
               Barcodes im Katalog anlernen
             </Link>
+            <label className="cursor-pointer rounded-lg border border-emerald-700 bg-white px-4 py-3 font-semibold text-emerald-900">
+              Kühlschrank fotografieren
+              <input type="file" accept="image/*" capture="environment" className="sr-only"
+                onChange={(event) => {
+                  void handleStockPhoto(event.target.files?.[0]);
+                  event.currentTarget.value = "";
+                }} />
+            </label>
           </div>
+
+          {stockPhoto && (
+            <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <p className="mb-2 font-semibold">Fotozählung prüfen</p>
+              <p className="mb-3 text-sm text-slate-700">Das Foto wird zur Analyse an OpenAI übertragen. Die Erkennung ist ein Vorschlag: Bitte die Mengen kontrollieren, bevor du speicherst. Das Foto wird nicht in der Datenbank gespeichert.</p>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={stockPhoto} alt="Aufgenommenes Kühlschrankfoto" className="max-h-96 rounded-lg object-contain" />
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button type="button" disabled={photoBusy || !stockPhotoFile} onClick={() => void countStockPhoto()}
+                  className="rounded-lg bg-emerald-700 px-4 py-2 font-semibold text-white disabled:opacity-50">
+                  {photoBusy ? "Foto wird analysiert …" : "Foto automatisch zählen"}
+                </button>
+                <button type="button" disabled={photoBusy} onClick={() => {
+                  if (stockPhoto) URL.revokeObjectURL(stockPhoto);
+                  setStockPhoto(null);
+                  setStockPhotoFile(null);
+                  setPhotoRecommendations([]);
+                }} className="rounded-lg border px-3 py-2 disabled:opacity-50">Foto entfernen</button>
+              </div>
+              {photoRecommendations.length > 0 && (
+                <ul className="mt-3 space-y-1 text-sm text-slate-700">
+                  {photoRecommendations.map((item) => (
+                    <li key={item.productId}>{item.productName}: Vorschlag {item.quantity} · Sicherheit {Math.round(item.confidence * 100)}%</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
 
           {scannerOpen && (
             <div className="mt-4 space-y-3">
@@ -1052,7 +1185,7 @@ export default function KuehlschraenkePage() {
           )}
 
           <div className="mt-5 space-y-3">
-            {products.map((product) => {
+            {visibleProducts.map((product) => {
               const before = oldQuantity(product.id);
               const after = currentQuantity(product.id);
               const removed = Math.max(0, before - after);
@@ -1081,6 +1214,14 @@ export default function KuehlschraenkePage() {
               );
             })}
           </div>
+
+          {visibleProducts.length === 0 && (
+            <p className="mt-5 rounded-lg bg-slate-100 p-4 text-slate-700">
+              {isCoffeeLocation
+                ? <>Noch kein Kaffeeartikel angelegt. Lege im <Link href="/katalog" className="underline">Produktkatalog</Link> z. B. „Kaffeebecher“ mit Kategorie „Heißgetränk“ an.</>
+                : "Keine Produkte mit Bestand vorhanden. Produkte mit Bestand 0 werden hier ausgeblendet."}
+            </p>
+          )}
 
           <button type="button" disabled={busy} onClick={() => void save()}
             className="mt-5 rounded-lg bg-emerald-700 px-5 py-3 font-semibold text-white disabled:opacity-50">

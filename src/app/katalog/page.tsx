@@ -490,10 +490,17 @@ export default function KatalogPage() {
         ) : (
           <section className="mb-8 space-y-3">
             {products.map((product) => (
-              <article
+              <details
                 key={product.id}
-                className="rounded-xl bg-white p-5 shadow-sm"
+                className="rounded-xl bg-white shadow-sm"
               >
+                <summary className="cursor-pointer list-none rounded-xl p-5 font-semibold hover:bg-slate-50">
+                  <span className="flex flex-wrap items-center justify-between gap-2">
+                    <span>{product.name} <span className="font-normal text-slate-500">· {product.category} · {product.unit}</span></span>
+                    <span className="text-sm font-normal text-slate-600">Bestand: {stocks[product.id] ?? product.stock}</span>
+                  </span>
+                </summary>
+                <div className="border-t border-slate-100 p-5">
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                   <label className="block sm:col-span-2 lg:col-span-1">
                     <span className="mb-1 block text-sm">Produktname</span>
@@ -609,7 +616,8 @@ export default function KatalogPage() {
                     Produkt löschen
                   </button>
                 </div>
-              </article>
+                </div>
+              </details>
             ))}
           </section>
         )}
