@@ -879,7 +879,10 @@ export default function KuehlschraenkePage() {
   return (
     <main className="min-h-screen bg-slate-50 px-4 py-8 text-slate-900">
       <div className="mx-auto max-w-5xl">
-        <Link href="/verkauf" className="text-emerald-800 underline">← Zurück zum Verkauf</Link>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <Link href="/verkauf" className="text-emerald-800 underline">← Zurück zum Verkauf</Link>
+          <Link href="/sitzplatzbestellung" className="rounded-lg border border-emerald-700 px-3 py-2 font-semibold text-emerald-900">Sitzplatzbestellung / QR-Codes</Link>
+        </div>
         <h1 className="mt-5 text-3xl font-bold">Kühlschrankbestand</h1>
         <p className="mt-2 text-slate-600">
           Bestand zählen, Gruppenentnahmen über mehrere Tage sammeln und am Ende gemeinsam abrechnen.
