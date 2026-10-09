@@ -876,6 +876,43 @@ export default function KuehlschraenkePage() {
     setMessage(`Gruppenfahrt „${finishedName}“ abgeschlossen. Beleg ${booking.booking_number}: ${euro.format(total)}.`);
   }
 
+  async function resetGroupTrip() {
+    if (!userId || !selectedTrip || busy) return;
+    const tripName = selectedTrip.customer_name;
+    const tripQuantity = selectedTripItems.reduce((sum, row) => sum + Number(row.quantity), 0);
+    const confirmed = window.confirm(
+      `Offene Gruppenfahrt „${tripName}“ wirklich zurücksetzen? Die Fahrt und ihre Abrechnungsposten werden entfernt. Nur die für diese Fahrt protokollierten Bestandsabgänge werden in den jeweiligen Kühlschränken zurückgebucht. Alle übrigen gespeicherten Bestände bleiben erhalten.`,
+    );
+    if (!confirmed) return;
+
+    setBusy(true);
+    setMessage("");
+    const { data, error } = await supabase.rpc("reset_group_sales_trip", {
+      p_trip_id: selectedTrip.id,
+    });
+    if (error) {
+      setBusy(false);
+      setMessage(`Gruppenfahrt konnte nicht zurückgesetzt werden: ${error.message}`);
+      return;
+    }
+
+    const result = data as { restored_units?: number } | null;
+    setSelectedTripId("");
+    setEditingTrip(false);
+    setMode("load");
+    setCounted({});
+    const refreshResults = await Promise.allSettled([
+      loadData(userId),
+      loadGroupTrips(userId),
+    ]);
+    setBusy(false);
+    const refreshFailed = refreshResults.some((refresh) => refresh.status === "rejected");
+    const restoredUnits = Number(result?.restored_units ?? 0);
+    setMessage(
+      `Gruppenfahrt „${tripName}“ zurückgesetzt. ${restoredUnits} Getränke aus den erfassten Entnahmen wurden dem Bestand wieder hinzugefügt.${refreshFailed ? " Lade die Seite neu, falls die aktualisierten Bestände noch nicht angezeigt werden." : ""}`,
+    );
+  }
+
   return (
     <main className="min-h-screen bg-slate-50 px-4 py-8 text-slate-900">
       <div className="mx-auto max-w-5xl">
@@ -910,7 +947,7 @@ export default function KuehlschraenkePage() {
           </p>
 
           {groupTrips.length > 0 && (
-            <div className="mt-4 grid gap-4 sm:grid-cols-[1fr_auto] sm:items-end">
+            <div className="mt-4 grid gap-4 sm:grid-cols-[1fr_auto_auto] sm:items-end">
               <label className="block">
                 <span className="mb-2 block font-medium">Offene Gruppenfahrt für alle Kühlschränke</span>
                 <select
@@ -935,6 +972,14 @@ export default function KuehlschraenkePage() {
                 className="rounded-lg bg-slate-900 px-4 py-3 font-semibold text-white disabled:opacity-50"
               >
                 Fahrt abschließen · {euro.format(selectedTripTotal)}
+              </button>
+              <button
+                type="button"
+                disabled={busy || !selectedTrip}
+                onClick={() => void resetGroupTrip()}
+                className="rounded-lg border border-red-300 bg-white px-4 py-3 font-semibold text-red-800 disabled:opacity-50"
+              >
+                Offene Fahrt zurücksetzen
               </button>
             </div>
           )}
