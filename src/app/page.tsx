@@ -12,18 +12,9 @@ type Booking = {
   booking_date: string;
   type: "income" | "expense";
   payment_method: "cash" | "bank";
-  payment_status: "paid" | "open";
-  paid_at: string | null;
   description: string;
   amount: number | string;
   document_no: string | null;
-};
-
-type PaidExpense = {
-  id: string;
-  total_amount: number | string | null;
-  payment_method: "cash" | "bank";
-  payment_status: "paid" | "open";
 };
 
 export default function Home() {
@@ -44,53 +35,30 @@ export default function Home() {
 
     setUserId(auth.user.id);
 
-    const [
-      { data: rows, error },
-      { data: paidExpenses, error: expenseError },
-      { data: settings },
-    ] = await Promise.all([
+    const [{ data: rows, error }, { data: settings }] = await Promise.all([
       supabase.from("bookings").select("*").eq("user_id", auth.user.id)
         .order("booking_date", { ascending: false }).order("created_at", { ascending: false }).limit(1000),
-      supabase
-        .from("incoming_expenses")
-        .select("id,total_amount,payment_method,payment_status")
-        .eq("user_id", auth.user.id)
-        .eq("payment_status", "paid")
-        .limit(1000),
       supabase.from("account_settings").select("*").eq("user_id", auth.user.id).maybeSingle(),
     ]);
 
-    if (error || expenseError) {
-      setMessage(
-        `Buchungen konnten nicht geladen werden: ${
-          error?.message || expenseError?.message || "Unbekannter Fehler"
-        }`
-      );
+    if (error) {
+      setMessage(`Buchungen konnten nicht geladen werden: ${error.message}`);
       return;
     }
 
     const all = (rows ?? []) as Booking[];
-    const allPaidExpenses = (paidExpenses ?? []) as PaidExpense[];
     const bankStart = Number(settings?.bank_opening_balance ?? 0);
     const cashStart = Number(settings?.cash_opening_balance ?? 0);
     setBankOpening(String(bankStart));
     setCashOpening(String(cashStart));
     setBookings(all.slice(0, 10));
 
-    const balances = all
-      .filter((row) => row.payment_status !== "open")
-      .reduce((sum, row) => {
-        const value = Number(row.amount) * (row.type === "income" ? 1 : -1);
-        if (row.payment_method === "bank") sum.bank += value;
-        if (row.payment_method === "cash") sum.cash += value;
-        return sum;
-      }, { bank: bankStart, cash: cashStart });
-
-    for (const expense of allPaidExpenses) {
-      const value = Number(expense.total_amount ?? 0);
-      if (expense.payment_method === "bank") balances.bank -= value;
-      if (expense.payment_method === "cash") balances.cash -= value;
-    }
+    const balances = all.reduce((sum, row) => {
+      const value = Number(row.amount) * (row.type === "income" ? 1 : -1);
+      if (row.payment_method === "bank") sum.bank += value;
+      if (row.payment_method === "cash") sum.cash += value;
+      return sum;
+    }, { bank: bankStart, cash: cashStart });
 
     setBankBalance(balances.bank);
     setCashBalance(balances.cash);
@@ -158,7 +126,7 @@ export default function Home() {
           </button>
         </section>
 
-        <section className="mt-6 grid gap-5 md:grid-cols-2 xl:grid-cols-4">
+        <section className="mt-6 grid gap-5 md:grid-cols-2 lg:grid-cols-4">
           <Link href="/verkauf" className="rounded-2xl bg-emerald-700 p-6 font-semibold text-white hover:bg-emerald-800">
             Verkauf erfassen →
           </Link>
@@ -166,10 +134,10 @@ export default function Home() {
             Eingangsbeleg / Ausgabe erfassen →
           </Link>
           <Link href="/katalog" className="rounded-2xl bg-white p-6 font-semibold shadow-sm ring-1 ring-slate-200">
-            Produktkatalog und Bestand →
+            Getränkekatalog und Bestand →
           </Link>
-          <Link href="/jahresabschluss" className="rounded-2xl bg-slate-900 p-6 font-semibold text-white shadow-sm">
-            Jahresabschluss und Steuerberaterpaket →
+          <Link href="/sitzplatzbestellung" className="rounded-2xl bg-white p-6 font-semibold shadow-sm ring-1 ring-slate-200 hover:ring-emerald-600">
+            Sitzplatzbestellung und QR-Codes →
           </Link>
         </section>
 
@@ -180,15 +148,13 @@ export default function Home() {
               <table className="w-full text-left">
                 <thead><tr className="border-b text-slate-500">
                   <th className="py-3 pr-4">Datum</th><th className="py-3 pr-4">Beschreibung</th>
-                  <th className="py-3 pr-4">Zahlungsart</th><th className="py-3 pr-4">Status</th>
-                  <th className="py-3 text-right">Betrag</th>
+                  <th className="py-3 pr-4">Zahlungsart</th><th className="py-3 text-right">Betrag</th>
                 </tr></thead>
                 <tbody>{bookings.map((row) => (
                   <tr key={row.id} className="border-b last:border-0">
                     <td className="py-3 pr-4">{new Date(row.booking_date).toLocaleDateString("de-AT")}</td>
                     <td className="py-3 pr-4">{row.description}</td>
                     <td className="py-3 pr-4">{row.payment_method === "cash" ? "Bar" : "Bank"}</td>
-                    <td className="py-3 pr-4">{row.payment_status === "open" ? "Offen" : "Bezahlt"}</td>
                     <td className={`py-3 text-right font-semibold ${row.type === "income" ? "text-emerald-700" : "text-red-700"}`}>
                       {row.type === "expense" ? "−" : "+"}{euro.format(Number(row.amount))}
                     </td>

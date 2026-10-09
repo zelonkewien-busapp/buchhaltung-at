@@ -8,8 +8,8 @@ const kacheln = [
     button: "Beleg erfassen",
   },
   {
-    titel: "Produktkatalog und Bestand",
-    text: "Getränke, Snacks, Preise und Warenzugänge verwalten.",
+    titel: "Getränkekatalog und Bestand",
+    text: "Produkte, Preise und Warenzugänge verwalten.",
     link: "/katalog",
     button: "Katalog öffnen",
   },
@@ -20,10 +20,10 @@ const kacheln = [
     button: "Betriebsdaten öffnen",
   },
   {
-    titel: "Jahresabschluss",
-    text: "Jahreszahlen prüfen, Inventur speichern und Steuerberaterpaket laden.",
-    link: "/jahresabschluss",
-    button: "Jahresabschluss öffnen",
+    titel: "Sitzplatzbestellung",
+    text: "Gruppenfahrten verwalten und dauerhafte Sitzplatz-QR-Codes drucken.",
+    link: "/sitzplatzbestellung",
+    button: "Sitzplatzbestellung öffnen",
   },
 ];
 
@@ -39,7 +39,7 @@ export default function Uebersicht() {
           </p>
         </header>
 
-        <section className="grid gap-5 md:grid-cols-2 xl:grid-cols-4">
+        <section className="grid gap-5 md:grid-cols-2 lg:grid-cols-4">
           {kacheln.map((kachel) => (
             <article
               key={kachel.titel}
