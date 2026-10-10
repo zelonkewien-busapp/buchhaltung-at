@@ -144,10 +144,13 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-slate-50 px-5 py-10 text-slate-900 sm:px-8">
-<section className="mx-auto max-w-7xl px-5 py-4">
-  <a href="/kuehlschraenke" className="inline-flex rounded-xl bg-emerald-700 px-5 py-3 font-semibold text-white">
+<section className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-5 py-4">
+  <a href="/kuehlschraenke" className="inline-flex rounded-xl bg-emerald-700 px-5 py-3 font-semibold text-white hover:bg-emerald-800">
     Kühlschrankverwaltung öffnen
   </a>
+  <Link href="/uebersicht" className="inline-flex rounded-xl bg-emerald-700 px-5 py-3 font-semibold text-white hover:bg-emerald-800">
+    Übersicht öffnen
+  </Link>
 </section>
       <div className="mx-auto max-w-6xl">
         <header className="mb-8">
