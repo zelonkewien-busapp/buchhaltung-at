@@ -80,12 +80,24 @@ export default function SeatOrderPage() {
       return;
     }
     setSending(true);
-    const { error } = await supabase.rpc("submit_seat_order", { p_token: token, p_lines: lines });
+    const { data, error } = await supabase.rpc("submit_seat_order", { p_token: token, p_lines: lines });
     if (error) {
       setMessage(error.message.replace(/^.*ERROR:\s*/, ""));
     } else {
       setCart({});
       setMessage("Bestellung ist gespeichert. Danke!");
+      const orderIds = (data as { orderIds?: string[] } | null)?.orderIds;
+      if (orderIds?.length) {
+        try {
+          await fetch("/api/push/order", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token, orderIds }),
+          });
+        } catch {
+          // Die Bestellung ist bereits gespeichert. Push-Ausfälle dürfen sie nicht rückgängig machen.
+        }
+      }
       await loadMenu();
     }
     setSending(false);

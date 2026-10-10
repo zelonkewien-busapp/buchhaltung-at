@@ -9,7 +9,17 @@ const supabase = createClient();
 const euro = new Intl.NumberFormat("de-AT", { style: "currency", currency: "EUR" });
 
 type Fridge = { id: string; name: string };
-type Trip = { id: string; customer_name: string; fridge_id: string; opened_at: string };
+type Trip = {
+  id: string;
+  customer_name: string;
+  fridge_id: string;
+  opened_at: string;
+  payment_method: "cash" | "bank";
+  customer_street: string | null;
+  customer_postal_code: string | null;
+  customer_city: string | null;
+};
+type Product = { id: string; name: string; price: number | string };
 type Seat = { id: string; trip_id: string; seat_number: number; access_token: string };
 type SeatCode = { id: string; seat_number: number; access_token: string };
 type SeatOrder = {
@@ -51,6 +61,7 @@ function SeatQr({ token, seatNumber }: { token: string; seatNumber: number }) {
 export default function SitzplatzbestellungPage() {
   const [userId, setUserId] = useState("");
   const [fridges, setFridges] = useState<Fridge[]>([]);
+  const [products, setProducts] = useState<Product[]>([]);
   const [trips, setTrips] = useState<Trip[]>([]);
   const [seats, setSeats] = useState<Seat[]>([]);
   const [seatCodes, setSeatCodes] = useState<SeatCode[]>([]);
@@ -63,12 +74,66 @@ export default function SitzplatzbestellungPage() {
   const [customerStreet, setCustomerStreet] = useState("");
   const [customerPostalCode, setCustomerPostalCode] = useState("");
   const [customerCity, setCustomerCity] = useState("");
+  const [manualSeatNumber, setManualSeatNumber] = useState("");
+  const [manualProductId, setManualProductId] = useState("");
+  const [manualQuantity, setManualQuantity] = useState("1");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [pushEnabled, setPushEnabled] = useState(false);
+  const [pushBusy, setPushBusy] = useState(false);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+    void navigator.serviceWorker.register("/sw.js")
+      .then((registration) => registration.pushManager.getSubscription())
+      .then((subscription) => setPushEnabled(Boolean(subscription)))
+      .catch(() => setPushEnabled(false));
+  }, []);
+
+  async function enablePushNotifications() {
+    const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+    if (!userId) { setMessage("Bitte zuerst anmelden, um Push-Mitteilungen einzurichten."); return; }
+    if (!vapidPublicKey) { setMessage("Push-Mitteilungen sind noch nicht fertig konfiguriert. Bitte die VAPID-Schlüssel in Vercel eintragen."); return; }
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+      setMessage("Dieser Browser unterstützt keine Push-Mitteilungen."); return;
+    }
+
+    setPushBusy(true);
+    setMessage("");
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") throw new Error("Mitteilungen wurden im Browser nicht erlaubt.");
+      const registration = await navigator.serviceWorker.register("/sw.js");
+      const padding = "=".repeat((4 - (vapidPublicKey.length % 4)) % 4);
+      const raw = atob((vapidPublicKey + padding).replace(/-/g, "+").replace(/_/g, "/"));
+      const keyBytes = Uint8Array.from(raw, (character) => character.charCodeAt(0));
+      let subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: keyBytes.buffer as ArrayBuffer,
+        });
+      }
+      const serialized = subscription.toJSON();
+      const { error } = await supabase.from("seat_push_subscriptions").upsert({
+        user_id: userId,
+        endpoint: subscription.endpoint,
+        subscription: serialized,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "endpoint" });
+      if (error) throw error;
+      setPushEnabled(true);
+      setMessage("Push-Mitteilungen sind aktiviert. Neue Sitzplatzbestellungen werden an dieses Gerät gemeldet.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Push-Mitteilungen konnten nicht aktiviert werden.");
+    } finally {
+      setPushBusy(false);
+    }
+  }
 
   const loadTrips = useCallback(async (id: string, preferredTripId?: string) => {
     const { data, error } = await supabase.from("group_sales_trips")
-      .select("id,customer_name,fridge_id,opened_at")
+      .select("id,customer_name,fridge_id,opened_at,payment_method,customer_street,customer_postal_code,customer_city")
       .eq("user_id", id)
       .eq("status", "open")
       .order("opened_at", { ascending: false });
@@ -116,11 +181,16 @@ export default function SitzplatzbestellungPage() {
       setUserId(data.user.id);
       try { await loadSeatCodes(); }
       catch (error) { setMessage(error instanceof Error ? error.message : "Dauerhafte Sitzplatz-Codes konnten nicht geladen werden."); }
-      const { data: fridgeRows, error: fridgeError } = await supabase.from("fridges")
-        .select("id,name").eq("user_id", data.user.id).order("name");
+      const [{ data: fridgeRows, error: fridgeError }, { data: productRows, error: productError }] = await Promise.all([
+        supabase.from("fridges").select("id,name").eq("user_id", data.user.id).order("name"),
+        supabase.from("products").select("id,name,price").eq("user_id", data.user.id)
+          .eq("is_active", true).not("price", "is", null).gt("price", 0).order("name"),
+      ]);
       if (fridgeError) { setMessage(fridgeError.message); return; }
+      if (productError) { setMessage(`Getränke konnten nicht geladen werden: ${productError.message}`); return; }
       const fridgeList = (fridgeRows ?? []) as Fridge[];
       setFridges(fridgeList);
+      setProducts((productRows ?? []) as Product[]);
       setFridgeId(fridgeList.find((fridge) => fridge.name === "Kühlschrank 1")?.id ?? fridgeList[0]?.id ?? "");
       try { await loadTrips(data.user.id); }
       catch (error) { setMessage(error instanceof Error ? error.message : "Fahrten konnten nicht geladen werden."); }
@@ -197,6 +267,48 @@ export default function SitzplatzbestellungPage() {
     setBusy(false);
   }
 
+  async function addManualOrder() {
+    if (!userId || !selectedTrip || busy) return;
+    const quantity = Number(manualQuantity);
+    if (!manualSeatNumber || !manualProductId) {
+      setMessage("Bitte Sitzplatz und Getränk auswählen.");
+      return;
+    }
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 20) {
+      setMessage("Die Menge muss zwischen 1 und 20 liegen.");
+      return;
+    }
+
+    setBusy(true);
+    setMessage("");
+    try {
+      const { error } = await supabase.rpc("add_manual_seat_order", {
+        p_trip_id: selectedTrip.id,
+        p_seat_number: Number(manualSeatNumber),
+        p_product_id: manualProductId,
+        p_quantity: quantity,
+      });
+      if (error) {
+        setMessage(`Manueller Verkauf konnte nicht gespeichert werden: ${error.message}`);
+        return;
+      }
+
+      const productName = products.find((product) => product.id === manualProductId)?.name ?? "Getränk";
+      setManualQuantity("1");
+      try {
+        await loadTripData(selectedTrip.id);
+      } catch (refreshError) {
+        setMessage(`Verkauf wurde gespeichert, die Sitzplatzliste konnte aber nicht aktualisiert werden: ${refreshError instanceof Error ? refreshError.message : "Bitte Seite neu laden."}`);
+        return;
+      }
+      setMessage(`${productName} × ${quantity} wurde für Sitzplatz ${manualSeatNumber} erfasst und vom Bestand abgezogen.`);
+    } catch (error) {
+      setMessage(`Manueller Verkauf konnte nicht gespeichert werden: ${error instanceof Error ? error.message : "Unbekannter Fehler"}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function printSeatCodes() { window.print(); }
 
   async function selectTrip(tripId: string) {
@@ -246,6 +358,16 @@ export default function SitzplatzbestellungPage() {
           </section>
 
           <section className="mt-5 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-xl font-bold">Bestellmitteilungen</h2>
+                <p className="mt-1 text-sm text-slate-600">Lass dich bei neuen QR-Bestellungen auf diesem Gerät benachrichtigen.</p>
+              </div>
+              <button type="button" onClick={() => void enablePushNotifications()} disabled={pushBusy || pushEnabled}
+                className="rounded-xl bg-emerald-700 px-5 py-3 font-bold text-white disabled:opacity-60">
+                {pushBusy ? "Wird eingerichtet …" : pushEnabled ? "Mitteilungen aktiviert" : "Push-Mitteilungen aktivieren"}
+              </button>
+            </div>
             <div className="flex flex-wrap items-end justify-between gap-4">
               <label className="min-w-64 flex-1 text-sm font-medium">Offene Fahrt
                 <select value={selectedTripId} onChange={(event) => void selectTrip(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-3 text-base">
@@ -266,6 +388,35 @@ export default function SitzplatzbestellungPage() {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-xl font-bold">Bestellungen je Sitzplatz</h2>
               <Link href="/kuehlschraenke" className="rounded-xl bg-slate-900 px-4 py-2 font-semibold text-white">Zur gemeinsamen Abrechnung</Link>
+            </div>
+            <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+              <h3 className="font-bold">Verkauf manuell für einen Sitzplatz erfassen</h3>
+              <p className="mt-1 text-sm text-slate-700">Für Gäste, die nicht selbst per QR-Code bestellen. Die Getränke werden dieser Fahrt und dem Sitzplatz zugeordnet, vom Kühlschrankbestand abgezogen und in den gemeinsamen Beleg übernommen.</p>
+              <p className="mt-2 rounded-lg bg-white/80 p-3 text-sm text-slate-700">
+                Rechnungsempfänger: <strong>{selectedTrip.customer_name}</strong> · {selectedTrip.payment_method === "bank" ? "Rechnung / Überweisung" : "Bar / sofort bezahlt"}
+                {selectedTrip.payment_method === "bank" && <><br />{[selectedTrip.customer_street, selectedTrip.customer_postal_code, selectedTrip.customer_city].filter(Boolean).join(", ") || "Rechnungsanschrift fehlt noch"}</>}
+                <br /><Link href="/kuehlschraenke" className="font-semibold text-emerald-800 underline">Rechnungsdaten und gemeinsame Abrechnung bearbeiten</Link>
+              </p>
+              <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_2fr_1fr_auto] sm:items-end">
+                <label className="text-sm font-medium">Sitzplatz
+                  <select value={manualSeatNumber} onChange={(event) => setManualSeatNumber(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-3">
+                    <option value="">Sitz auswählen</option>
+                    {seats.map((seat) => <option key={seat.id} value={seat.seat_number}>Sitzplatz {seat.seat_number}</option>)}
+                  </select>
+                </label>
+                <label className="text-sm font-medium">Getränk
+                  <select value={manualProductId} onChange={(event) => setManualProductId(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-3">
+                    <option value="">Getränk auswählen</option>
+                    {products.map((product) => <option key={product.id} value={product.id}>{product.name} · {euro.format(Number(product.price))}</option>)}
+                  </select>
+                </label>
+                <label className="text-sm font-medium">Menge
+                  <input type="number" min="1" max="20" step="1" value={manualQuantity} onChange={(event) => setManualQuantity(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-3" />
+                </label>
+                <button type="button" disabled={busy || !seats.length || !products.length} onClick={() => void addManualOrder()} className="rounded-lg bg-emerald-700 px-4 py-3 font-semibold text-white disabled:opacity-50">
+                  {busy ? "Speichert …" : "Verkauf erfassen"}
+                </button>
+              </div>
             </div>
             <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {seats.map((seat) => {
